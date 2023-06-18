@@ -237,7 +237,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	DPrintf("server %v send append entry rpc to server %v...", rf.me, server)
-	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
