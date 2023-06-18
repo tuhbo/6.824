@@ -1,6 +1,8 @@
 package mr
 
-import "fmt"
+import (
+	"fmt"
+)
 
 const (
 	TaskMap      = 1
