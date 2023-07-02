@@ -43,6 +43,12 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type LogEntry struct {
+	Term int
+	Idx  int
+	Cmd  interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -62,6 +68,13 @@ type Raft struct {
 	grantVoteCh chan struct{} // 用于Follower重置election timer
 	leaderCh    chan struct{} // 用于Candidate 选举成功重置election timer
 	heartBeatCh chan struct{}
+	applych     chan ApplyMsg
+	commitCh    chan struct{}
+	entry       []LogEntry // 日志条目
+	commitIdx   int        // 最新一次提交的日志编号
+	lastApplied int        // 最新一次回应client的日志编号
+	nextIdx     []int      // 送给每个服务器下一条日志条目索引号(初始化为leader的最高索引号+1)
+	matchIdx    []int      // 已知要复制到每个服务器上的最高日志条目号
 }
 
 // return currentTerm and whether this server
@@ -116,6 +129,8 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term        int
 	CandidateId int
+	LastLogIdx  int // candidate最新日志索引号
+	LastLogTerm int // LastLogIdx的任期
 }
 
 // example RequestVote RPC reply structure.
@@ -127,13 +142,18 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term         int
+	LeaderId     int
+	PrevLogIdx   int // leader当前最大的日志索引
+	PrevLogTerm  int // PrevLogIdx的任期
+	Entry        []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	NextIdx int
 }
 
 func (rf *Raft) roleToString() string {
@@ -152,8 +172,8 @@ func (rf *Raft) roleToString() string {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	DPrintf("server id %v receive request vote rpc from candidate %v candidate term %v cur term %v cur role %v",
-		rf.me, args.CandidateId, args.Term, rf.currentTerm, rf.roleToString())
+	DPrintf("%v %v receive request vote rpc from candidate %v candidate term %v cur term %v...",
+		rf.roleToString(), rf.me, args.CandidateId, args.Term, rf.currentTerm)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -171,7 +191,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 	}
 
-	if rf.votedFor == NoOne || rf.votedFor == args.CandidateId {
+	update := false
+	DPrintf("%v %v lastLogIdx %v lastLogTerm %v args.LastLogIdx %v args.LastLogTerm %v...",
+		rf.roleToString(), rf.me, rf.lastLogIdx(), rf.lastLogTerm(), args.LastLogIdx, args.LastLogTerm)
+	if args.LastLogTerm > rf.lastLogTerm() ||
+		(args.LastLogTerm == rf.lastLogTerm() && args.LastLogIdx >= rf.lastLogIdx()) { // 任期号大的新
+		update = true
+	}
+
+	if (rf.votedFor == NoOne || rf.votedFor == args.CandidateId) && update {
 		rf.votedFor = args.CandidateId
 		rf.role = Follower
 		reply.VoteGranted = true
@@ -180,8 +208,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("server id %v receive append entry rpc from leader %v leader's term %v cur term %v cur role %v",
-		rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.roleToString())
+	DPrintf("%v %v receive append entry rpc from leader %v leader's term %v cur term %v...",
+		rf.roleToString(), rf.me, args.LeaderId, args.Term, rf.currentTerm)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -198,8 +226,37 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = NoOne
 	}
 
-	reply.Success = true
+	DPrintf("%v %v lastLogIdx %v lastLogTerm %v commitIdx %v args.PrevLogIdx %v args.PrevLogTerm %v args.LeaderCommit %v len of args.entry %v LeaderId %v...",
+		rf.roleToString(), rf.me, rf.lastLogIdx(), rf.lastLogTerm(), rf.commitIdx, args.PrevLogIdx, args.PrevLogTerm, args.LeaderCommit, len(args.Entry), args.LeaderId)
+
 	rf.heartBeatCh <- struct{}{}
+	if args.PrevLogIdx < rf.commitIdx {
+		return
+	}
+
+	if len(args.Entry) == 0 {
+		goto COMMIT
+	}
+
+	if rf.entry[args.PrevLogIdx].Term != args.PrevLogTerm {
+		// 删除冲突点以及之后的所有日志
+		rf.entry = rf.entry[:args.PrevLogIdx]
+		reply.NextIdx = rf.lastLogIdx() + 1
+		return
+	}
+
+	rf.entry = rf.entry[:args.PrevLogIdx+1]
+	rf.entry = append(rf.entry, args.Entry...)
+
+COMMIT:
+	reply.Success = true
+	rf.votedFor = args.LeaderId
+
+	if args.LeaderCommit > rf.commitIdx {
+		rf.commitIdx = min(args.LeaderCommit, rf.lastLogIdx())
+		rf.commitCh <- struct{}{} // 告诉主线程leader已经提交
+	}
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -230,19 +287,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	DPrintf("server %v send request vote rpc to server %v...", rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	DPrintf("server %v send append entry rpc to server %v...", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
-func (rf *Raft) HandleAppendEntryReply(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("server %v handle append entry reply...", rf.me)
+func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	DPrintf("%v %v handle append entry reply from server %v...", rf.roleToString(), rf.me, id)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -255,10 +310,39 @@ func (rf *Raft) HandleAppendEntryReply(args *AppendEntriesArgs, reply *AppendEnt
 		rf.currentTerm = reply.Term
 		rf.votedFor = NoOne
 	}
+
+	if reply.Success {
+		rf.nextIdx[id] = args.PrevLogIdx + len(args.Entry) + 1
+		rf.matchIdx[id] = rf.nextIdx[id] - 1
+		DPrintf("server %v nextIdx %v matchIdx %v...", id, rf.nextIdx[id], rf.matchIdx[id])
+
+		N := rf.commitIdx
+
+		for i := N + 1; i <= rf.lastLogIdx(); i++ {
+			count := 0
+			for j, _ := range rf.peers {
+				if j != rf.me && rf.matchIdx[j] >= i && rf.entry[i].Term == rf.currentTerm {
+					count++
+				}
+			}
+
+			if count > len(rf.peers)/2 {
+				N = i
+				break
+			}
+		}
+
+		if N > rf.commitIdx {
+			rf.commitIdx = N
+			rf.commitCh <- struct{}{}
+		}
+	} else {
+		rf.nextIdx[id] = reply.NextIdx
+	}
 }
 
-func (rf *Raft) HandleRequestVoteReply(args *RequestVoteArgs, reply *RequestVoteReply) {
-	DPrintf("server %v handle request vote reply...", rf.me)
+func (rf *Raft) HandleRequestVoteReply(id int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	DPrintf("%v %v handle request vote reply from server %v...", rf.roleToString(), rf.me, id)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -298,9 +382,21 @@ func (rf *Raft) HandleRequestVoteReply(args *RequestVoteArgs, reply *RequestVote
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := rf.role == Leader
+
+	if isLeader {
+		DPrintf("%v %v lastLogIdx %v lastLogTerm %v append entry...", rf.roleToString(), rf.me, rf.lastLogIdx(), rf.lastLogTerm())
+		rf.entry = append(rf.entry, LogEntry{Term: rf.currentTerm,
+			Idx: rf.lastLogIdx() + 1,
+			Cmd: command})
+		index = rf.lastLogIdx()
+		term = rf.lastLogTerm()
+	}
 
 	// Your code here (2B).
 
@@ -331,6 +427,8 @@ func (rf *Raft) broadCastRequestVoteRpc() {
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
+		LastLogIdx:  rf.lastLogIdx(),
+		LastLogTerm: rf.lastLogTerm(),
 	}
 	rf.mu.Unlock()
 
@@ -340,7 +438,7 @@ func (rf *Raft) broadCastRequestVoteRpc() {
 				reply := RequestVoteReply{}
 				ok := rf.sendRequestVote(id, &args, &reply)
 				if ok {
-					rf.HandleRequestVoteReply(&args, &reply)
+					rf.HandleRequestVoteReply(id, &args, &reply)
 				}
 			}(i)
 		}
@@ -349,21 +447,55 @@ func (rf *Raft) broadCastRequestVoteRpc() {
 
 func (rf *Raft) broadCastAppendEntryRpc() {
 	rf.mu.Lock()
-	args := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-	}
-	rf.mu.Unlock()
+	defer rf.mu.Unlock()
 
 	for i, _ := range rf.peers {
 		if i != rf.me && rf.role == Leader {
 			go func(id int) {
+				args := AppendEntriesArgs{
+					Term:     rf.currentTerm,
+					LeaderId: rf.me,
+				}
+				args.LeaderCommit = rf.commitIdx
+
+				DPrintf("leader %v send log entry to server %v lastlogidx %v nextidx %v...", rf.me, id, rf.lastLogIdx(), rf.nextIdx[id])
+				if rf.lastLogIdx() >= rf.nextIdx[id] {
+					args.PrevLogIdx = rf.nextIdx[id] - 1
+				} else {
+					args.PrevLogIdx = rf.lastLogIdx()
+				}
+
+				args.PrevLogTerm = rf.entry[args.PrevLogIdx].Term
+				args.Entry = make([]LogEntry, len(rf.entry[args.PrevLogIdx+1:]))
+				copy(args.Entry, rf.entry[args.PrevLogIdx+1:])
+
 				reply := AppendEntriesReply{}
 				ok := rf.sendAppendEntry(id, &args, &reply)
 				if ok {
-					rf.HandleAppendEntryReply(&args, &reply)
+					rf.HandleAppendEntryReply(id, &args, &reply)
 				}
 			}(i)
+		}
+	}
+}
+
+func (rf *Raft) commit() {
+	for !rf.killed() {
+		select {
+		case <-rf.commitCh:
+			rf.mu.Lock()
+			for i := rf.lastApplied + 1; i <= rf.commitIdx; i++ {
+				msg := ApplyMsg{
+					CommandValid: true,
+					CommandIndex: i,
+					Command:      rf.entry[i].Cmd,
+				}
+				rf.mu.Unlock()
+				rf.applych <- msg
+				rf.mu.Lock()
+				rf.lastApplied += 1
+			}
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -376,6 +508,7 @@ func (rf *Raft) run() {
 			case <-rf.grantVoteCh:
 			case <-rf.heartBeatCh:
 			case <-time.After(randElectionTimeOut()):
+				DPrintf("server %v election timer times out Follower ---> Candidate...", rf.me)
 				rf.mu.Lock()
 				rf.role = Candidate
 				rf.mu.Unlock()
@@ -391,23 +524,35 @@ func (rf *Raft) run() {
 			rf.broadCastRequestVoteRpc()
 
 			select {
+			case <-time.After(ElectionTimeOut):
 			case <-rf.heartBeatCh: // 收到来自其他leader的心跳消息
 				rf.mu.Lock()
+				DPrintf("server %v is Candidate receive other leader heartBeatch Candidate ---> Follower...", rf.me)
 				rf.role = Follower
 				rf.mu.Unlock()
 			case <-rf.leaderCh:
+				DPrintf("%v %v election success, come to be Leader lastLogIdx %v lastLogTerm %v...", rf.roleToString(), rf.me, rf.lastLogIdx(), rf.lastLogTerm())
 				rf.mu.Lock()
 				rf.role = Leader
+
+				// ------------ Log Replication
+				rf.nextIdx = make([]int, len(rf.peers))
+				rf.matchIdx = make([]int, len(rf.peers))
+
+				DPrintf("server %v init nextIdx and matchIdx...", rf.me)
+				for i, _ := range rf.peers {
+					rf.nextIdx[i] = rf.lastLogIdx() + 1
+					rf.matchIdx[i] = 0
+				}
 				rf.mu.Unlock()
-			case <-time.After(ElectionTimeOut):
 			}
 			break
 		case Leader:
 			rf.broadCastAppendEntryRpc()
 			time.Sleep(HeartBeatTimeOut)
 			break
-
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -433,11 +578,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		grantVoteCh: make(chan struct{}, ChanCap),
 		leaderCh:    make(chan struct{}, ChanCap),
 		heartBeatCh: make(chan struct{}, ChanCap),
+		applych:     applyCh,
+		entry:       make([]LogEntry, 0),
+		commitIdx:   0,
+		lastApplied: 0,
 	}
 	// Your initialization code here (2A, 2B, 2C).
-
+	rf.entry = append(rf.entry, LogEntry{Idx: 0, Term: 0})
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	go rf.run()
+	go rf.commit()
 	return rf
 }

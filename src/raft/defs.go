@@ -23,3 +23,18 @@ func randElectionTimeOut() time.Duration {
 	t := time.Duration(r.Int63()) % ElectionTimeOut
 	return ElectionTimeOut + t
 }
+
+func (rf *Raft) lastLogIdx() int {
+	return rf.entry[len(rf.entry)-1].Idx
+}
+
+func (rf *Raft) lastLogTerm() int {
+	return rf.entry[len(rf.entry)-1].Term
+}
+
+func min(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
