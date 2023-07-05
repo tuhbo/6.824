@@ -123,39 +123,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term        int
-	CandidateId int
-	LastLogIdx  int // candidate最新日志索引号
-	LastLogTerm int // LastLogIdx的任期
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int
-	VoteGranted bool
-}
-
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIdx   int // leader当前最大的日志索引
-	PrevLogTerm  int // PrevLogIdx的任期
-	Entry        []LogEntry
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-	NextIdx int
-}
-
 func (rf *Raft) roleToString() string {
 	switch rf.role {
 	case Follower:
@@ -167,206 +134,6 @@ func (rf *Raft) roleToString() string {
 	default:
 		return "???"
 	}
-}
-
-// example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-	DPrintf("%v %v receive request vote rpc from candidate %v candidate term %v cur term %v...",
-		rf.roleToString(), rf.me, args.CandidateId, args.Term, rf.currentTerm)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	// 默认不投票
-	reply.Term = rf.currentTerm
-	reply.VoteGranted = false
-
-	if args.Term < rf.currentTerm {
-		return
-	}
-
-	if args.Term > rf.currentTerm {
-		rf.votedFor = NoOne
-		rf.role = Follower
-		rf.currentTerm = args.Term
-	}
-
-	update := false
-	DPrintf("%v %v lastLogIdx %v lastLogTerm %v args.LastLogIdx %v args.LastLogTerm %v...",
-		rf.roleToString(), rf.me, rf.lastLogIdx(), rf.lastLogTerm(), args.LastLogIdx, args.LastLogTerm)
-	if args.LastLogTerm > rf.lastLogTerm() ||
-		(args.LastLogTerm == rf.lastLogTerm() && args.LastLogIdx >= rf.lastLogIdx()) { // 任期号大的新
-		update = true
-	}
-
-	if (rf.votedFor == NoOne || rf.votedFor == args.CandidateId) && update {
-		rf.votedFor = args.CandidateId
-		rf.role = Follower
-		reply.VoteGranted = true
-		rf.grantVoteCh <- struct{}{} // to reset election timer
-	}
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("%v %v receive append entry rpc from leader %v leader's term %v cur term %v...",
-		rf.roleToString(), rf.me, args.LeaderId, args.Term, rf.currentTerm)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	reply.Term = rf.currentTerm
-	reply.Success = false
-
-	if args.Term < rf.currentTerm {
-		return
-	}
-
-	if args.Term > rf.currentTerm { // 旧leader可能收到新leader的心跳消息
-		rf.role = Follower
-		rf.currentTerm = args.Term
-		rf.votedFor = NoOne
-	}
-
-	DPrintf("%v %v lastLogIdx %v lastLogTerm %v commitIdx %v args.PrevLogIdx %v args.PrevLogTerm %v args.LeaderCommit %v len of args.entry %v LeaderId %v...",
-		rf.roleToString(), rf.me, rf.lastLogIdx(), rf.lastLogTerm(), rf.commitIdx, args.PrevLogIdx, args.PrevLogTerm, args.LeaderCommit, len(args.Entry), args.LeaderId)
-
-	rf.heartBeatCh <- struct{}{}
-	if args.PrevLogIdx < rf.commitIdx {
-		return
-	}
-
-	if len(args.Entry) == 0 {
-		goto COMMIT
-	}
-
-	if rf.entry[args.PrevLogIdx].Term != args.PrevLogTerm {
-		// 删除冲突点以及之后的所有日志
-		rf.entry = rf.entry[:args.PrevLogIdx]
-		reply.NextIdx = rf.lastLogIdx() + 1
-		return
-	}
-
-	rf.entry = rf.entry[:args.PrevLogIdx+1]
-	rf.entry = append(rf.entry, args.Entry...)
-
-COMMIT:
-	reply.Success = true
-	rf.votedFor = args.LeaderId
-
-	if args.LeaderCommit > rf.commitIdx {
-		rf.commitIdx = min(args.LeaderCommit, rf.lastLogIdx())
-		rf.commitCh <- struct{}{} // 告诉主线程leader已经提交
-	}
-
-}
-
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
-func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
-
-func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("%v %v handle append entry reply from server %v...", rf.roleToString(), rf.me, id)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if rf.role != Leader || args.Term != rf.currentTerm {
-		return
-	}
-
-	if reply.Term > rf.currentTerm {
-		rf.role = Follower
-		rf.currentTerm = reply.Term
-		rf.votedFor = NoOne
-	}
-
-	if reply.Success {
-		rf.nextIdx[id] = args.PrevLogIdx + len(args.Entry) + 1
-		rf.matchIdx[id] = rf.nextIdx[id] - 1
-		DPrintf("server %v nextIdx %v matchIdx %v...", id, rf.nextIdx[id], rf.matchIdx[id])
-
-		N := rf.commitIdx
-
-		for i := N + 1; i <= rf.lastLogIdx(); i++ {
-			count := 0
-			for j, _ := range rf.peers {
-				if j != rf.me && rf.matchIdx[j] >= i && rf.entry[i].Term == rf.currentTerm {
-					count++
-				}
-			}
-
-			if count > len(rf.peers)/2 {
-				N = i
-				break
-			}
-		}
-
-		if N > rf.commitIdx {
-			rf.commitIdx = N
-			rf.commitCh <- struct{}{}
-		}
-	} else {
-		rf.nextIdx[id] = reply.NextIdx
-	}
-}
-
-func (rf *Raft) HandleRequestVoteReply(id int, args *RequestVoteArgs, reply *RequestVoteReply) {
-	DPrintf("%v %v handle request vote reply from server %v...", rf.roleToString(), rf.me, id)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	// 已经不是candidade 或者当前任期过期了
-	if rf.role != Candidate || args.Term != rf.currentTerm {
-		return
-	}
-
-	if reply.Term > rf.currentTerm {
-		rf.role = Follower
-		rf.votedFor = NoOne
-		rf.voteCount = 0
-		rf.currentTerm = reply.Term
-		return
-	}
-
-	if reply.VoteGranted {
-		rf.voteCount++
-		if rf.role == Candidate && rf.voteCount > len(rf.peers)/2 {
-			rf.role = Leader
-			rf.leaderCh <- struct{}{}
-		}
-	}
-
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -436,6 +203,7 @@ func (rf *Raft) broadCastRequestVoteRpc() {
 		if i != rf.me && rf.role == Candidate {
 			go func(id int) {
 				reply := RequestVoteReply{}
+				DPrintf("Candidate %v send request vote to server %v", rf.me, id)
 				ok := rf.sendRequestVote(id, &args, &reply)
 				if ok {
 					rf.HandleRequestVoteReply(id, &args, &reply)
@@ -484,6 +252,7 @@ func (rf *Raft) commit() {
 		select {
 		case <-rf.commitCh:
 			rf.mu.Lock()
+			DPrintf("%v %v lastApplyId %v commitIdx %v", rf.roleToString(), rf.me, rf.lastApplied, rf.commitIdx)
 			for i := rf.lastApplied + 1; i <= rf.commitIdx; i++ {
 				msg := ApplyMsg{
 					CommandValid: true,
@@ -493,7 +262,7 @@ func (rf *Raft) commit() {
 				rf.mu.Unlock()
 				rf.applych <- msg
 				rf.mu.Lock()
-				rf.lastApplied += 1
+				rf.lastApplied = i
 			}
 			rf.mu.Unlock()
 		}
@@ -521,7 +290,7 @@ func (rf *Raft) run() {
 			rf.votedFor = rf.me
 			rf.mu.Unlock()
 
-			rf.broadCastRequestVoteRpc()
+			go rf.broadCastRequestVoteRpc()
 
 			select {
 			case <-time.After(ElectionTimeOut):
@@ -578,8 +347,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		grantVoteCh: make(chan struct{}, ChanCap),
 		leaderCh:    make(chan struct{}, ChanCap),
 		heartBeatCh: make(chan struct{}, ChanCap),
+		commitCh:    make(chan struct{}, ChanCap),
 		applych:     applyCh,
-		entry:       make([]LogEntry, 0),
 		commitIdx:   0,
 		lastApplied: 0,
 	}
