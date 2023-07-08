@@ -153,7 +153,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 
 	index := -1
-	term := -1
+	term := rf.currentTerm
 	isLeader := rf.role == Leader
 
 	if isLeader {
@@ -162,7 +162,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Idx: rf.lastLogIdx() + 1,
 			Cmd: command})
 		index = rf.lastLogIdx()
-		term = rf.lastLogTerm()
 	}
 
 	// Your code here (2B).
@@ -277,7 +276,7 @@ func (rf *Raft) run() {
 			case <-rf.grantVoteCh:
 			case <-rf.heartBeatCh:
 			case <-time.After(randElectionTimeOut()):
-				DPrintf("server %v election timer times out Follower ---> Candidate...", rf.me)
+				DPrintf("server %v term %v election timer times out Follower ---> Candidate...", rf.me, rf.currentTerm)
 				rf.mu.Lock()
 				rf.role = Candidate
 				rf.mu.Unlock()
@@ -285,15 +284,16 @@ func (rf *Raft) run() {
 			break
 		case Candidate:
 			rf.mu.Lock()
+			DPrintf("%v %v term %v ---> %v ....", rf.roleToString(), rf.me, rf.currentTerm, rf.currentTerm+1)
 			rf.currentTerm += 1
 			rf.voteCount = 1
 			rf.votedFor = rf.me
 			rf.mu.Unlock()
 
-			go rf.broadCastRequestVoteRpc()
+			rf.broadCastRequestVoteRpc()
 
 			select {
-			case <-time.After(ElectionTimeOut):
+			case <-time.After(randElectionTimeOut()):
 			case <-rf.heartBeatCh: // 收到来自其他leader的心跳消息
 				rf.mu.Lock()
 				DPrintf("server %v is Candidate receive other leader heartBeatch Candidate ---> Follower...", rf.me)

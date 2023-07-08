@@ -28,6 +28,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
+	reply.NextIdx = rf.lastLogIdx() + 1
 
 	if args.Term < rf.currentTerm {
 		DPrintf("%v %v receive old append entry ...", rf.roleToString(), rf.me)
@@ -46,12 +47,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.heartBeatCh <- struct{}{}
 	rf.votedFor = args.LeaderId
-	if args.PrevLogIdx < rf.commitIdx {
+	if args.PrevLogIdx < rf.commitIdx { // 已经提交的日志不能被覆盖
 		return
 	}
 
-	if len(args.Entry) == 0 {
-		goto COMMIT
+	if rf.lastLogIdx() < args.PrevLogIdx { // log entry的下标越界了
+		return
 	}
 
 	if rf.entry[args.PrevLogIdx].Term != args.PrevLogTerm {
@@ -61,15 +62,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	reply.Success = true
+	if len(args.Entry) == 0 {
+		goto COMMIT
+	}
+
 	rf.entry = rf.entry[:args.PrevLogIdx+1]
 	rf.entry = append(rf.entry, args.Entry...)
 
 COMMIT:
-	reply.Success = true
-	rf.votedFor = args.LeaderId
-
 	if args.LeaderCommit > rf.commitIdx {
-		rf.commitIdx = min(args.LeaderCommit, rf.lastLogIdx())
+		rf.commitIdx = args.LeaderCommit
+		if args.LeaderCommit > rf.lastLogIdx() {
+			rf.commitIdx = rf.lastLogIdx()
+		}
 		DPrintf("server %v send message to commit ch commitId %v", rf.me, rf.commitIdx)
 		rf.commitCh <- struct{}{} // 告诉主线程leader已经提交
 	}
@@ -77,9 +83,9 @@ COMMIT:
 }
 
 func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("%v %v handle append entry reply from server %v...", rf.roleToString(), rf.me, id)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf("%v %v cur term %v handle append entry reply from server %v 's term %v...", rf.roleToString(), rf.me, rf.currentTerm, id, reply.Term)
 
 	if rf.role != Leader || args.Term != rf.currentTerm {
 		return
@@ -99,7 +105,7 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntriesArgs, reply *A
 		N := rf.commitIdx
 
 		for i := N + 1; i <= rf.lastLogIdx(); i++ {
-			count := 0
+			count := 1
 			for j, _ := range rf.peers {
 				if j != rf.me && rf.matchIdx[j] >= i && rf.entry[i].Term == rf.currentTerm {
 					count++
