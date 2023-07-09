@@ -15,6 +15,8 @@ const (
 	ChanCap          = 100
 	ElectionTimeOut  = time.Millisecond * 250 /* 要远大于论文中的 150-300 ms 才有意义，当然也要保证在 5 秒之内完成测试 */
 	HeartBeatTimeOut = time.Millisecond * 100 /* 心跳 1 秒不超过 10 次 */
+	OutRange         = -1
+	Committed        = -2
 )
 
 /* 生成随机超时时间，在 250ms~500 ms 范围之内 */

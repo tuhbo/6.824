@@ -12,7 +12,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
-	NextIdx int
+	// NextIdx int
+	XTerm int // 冲突点日志的任期
+	XIdx  int // XTerm期间的第一条日志的idx
+	XLen  int // follower所拥有的日志长度
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -29,7 +32,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
-	reply.NextIdx = rf.lastLogIdx() + 1
+	// reply.NextIdx = rf.lastLogIdx() + 1
 
 	if args.Term < rf.currentTerm {
 		DPrintf("%v %v receive old append entry ...", rf.roleToString(), rf.me)
@@ -49,17 +52,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.heartBeatCh <- struct{}{}
 	rf.votedFor = args.LeaderId
 	if args.PrevLogIdx < rf.commitIdx { // 已经提交的日志不能被覆盖
+		reply.XTerm = Committed
+		reply.XIdx = rf.commitIdx + 1
 		return
 	}
 
 	if rf.lastLogIdx() < args.PrevLogIdx { // log entry的下标越界了
+		reply.XTerm = OutRange
+		reply.XLen = len(rf.entry)
 		return
 	}
 
 	if rf.entry[args.PrevLogIdx].Term != args.PrevLogTerm {
-		// 删除冲突点以及之后的所有日志
-		rf.entry = rf.entry[:args.PrevLogIdx]
-		reply.NextIdx = rf.lastLogIdx() + 1
+		// /* 删除冲突点以及之后的所有日志*/
+		// rf.entry = rf.entry[:args.PrevLogIdx]
+		// reply.NextIdx = rf.lastLogIdx() + 1
+		reply.XTerm = rf.entry[args.PrevLogIdx].Term
+		reply.XIdx = args.PrevLogIdx
+		for i := args.PrevLogIdx; i >= 0; i-- {
+			if rf.entry[i].Term != reply.XTerm {
+				reply.XIdx = i + 1
+				break
+			}
+		}
 		return
 	}
 
@@ -126,6 +141,28 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntriesArgs, reply *A
 			rf.commitCh <- struct{}{}
 		}
 	} else {
-		rf.nextIdx[id] = reply.NextIdx
+		// rf.nextIdx[id] = reply.NextIdx
+		if reply.XTerm == OutRange {
+			rf.nextIdx[id] = reply.XLen
+		} else if reply.XTerm == Committed {
+			rf.nextIdx[id] = reply.XIdx
+		} else {
+			termNotExist := true
+
+			for i := rf.lastLogIdx(); i >= 1; i-- { // 找到xterm的第一个日志条目
+				if rf.entry[i].Term == reply.XTerm {
+					termNotExist = false
+					rf.nextIdx[id] = i
+					break
+				}
+
+				if rf.entry[i].Term < reply.XTerm {
+					break
+				}
+			}
+			if termNotExist {
+				rf.nextIdx[id] = reply.XIdx
+			}
+		}
 	}
 }

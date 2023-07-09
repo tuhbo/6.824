@@ -355,12 +355,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		leaderCh:    make(chan struct{}, ChanCap),
 		heartBeatCh: make(chan struct{}, ChanCap),
 		commitCh:    make(chan struct{}, ChanCap),
+		nextIdx:     make([]int, len(peers)),
+		matchIdx:    make([]int, len(peers)),
 		applych:     applyCh,
 		commitIdx:   0,
 		lastApplied: 0,
 	}
 	// Your initialization code here (2A, 2B, 2C).
 	rf.entry = append(rf.entry, LogEntry{Idx: 0, Term: 0})
+	for i := range rf.peers {
+		rf.nextIdx[i] = rf.lastLogIdx() + 1
+		rf.matchIdx[i] = 0
+	}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	go rf.run()
