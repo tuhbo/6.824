@@ -57,6 +57,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	DPrintf("%v %v receive request vote rpc from candidate %v candidate term %v cur term %v...",
 		rf.roleToString(), rf.me, args.CandidateId, args.Term, rf.currentTerm)
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	// 默认不投票
 	reply.Term = rf.currentTerm
@@ -103,6 +104,7 @@ func (rf *Raft) HandleRequestVoteReply(id int, args *RequestVoteArgs, reply *Req
 		rf.role = Follower
 		rf.votedFor = NoOne
 		rf.currentTerm = reply.Term
+		rf.persist()
 		return
 	}
 

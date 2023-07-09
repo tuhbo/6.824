@@ -23,6 +23,7 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *Appe
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	DPrintf("%v %v receive append entry rpc from leader %v leader's term %v cur term %v...",
 		rf.roleToString(), rf.me, args.LeaderId, args.Term, rf.currentTerm)
 
@@ -95,6 +96,7 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntriesArgs, reply *A
 		rf.role = Follower
 		rf.currentTerm = reply.Term
 		rf.votedFor = NoOne
+		rf.persist()
 	}
 
 	if reply.Success {

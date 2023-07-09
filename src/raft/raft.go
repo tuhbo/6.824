@@ -18,10 +18,13 @@ package raft
 //
 
 import (
+	"bytes"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"6.824/src/labgob"
 	"6.824/src/labrpc"
 )
 
@@ -93,14 +96,15 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	// 持久化当前的任期，投票的id，日志
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.entry)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -108,19 +112,20 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var CurTerm int
+	var VoteFor int
+	var entry []LogEntry
+
+	if d.Decode(&CurTerm) != nil || d.Decode(&VoteFor) != nil || d.Decode(&entry) != nil {
+		DPrintf("read persist fail....")
+		runtime.Goexit()
+	} else {
+		rf.currentTerm = CurTerm
+		rf.votedFor = VoteFor
+		rf.entry = entry
+	}
 }
 
 func (rf *Raft) roleToString() string {
@@ -151,6 +156,7 @@ func (rf *Raft) roleToString() string {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	index := -1
 	term := rf.currentTerm
@@ -288,9 +294,10 @@ func (rf *Raft) run() {
 			rf.currentTerm += 1
 			rf.voteCount = 1
 			rf.votedFor = rf.me
+			rf.persist()
 			rf.mu.Unlock()
 
-			rf.broadCastRequestVoteRpc()
+			go rf.broadCastRequestVoteRpc()
 
 			select {
 			case <-time.After(randElectionTimeOut()):
