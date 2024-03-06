@@ -20,6 +20,7 @@ package raft
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.824/src/labrpc"
 )
@@ -54,6 +55,13 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	curState       State
+	curTerm        int
+	voteFor        int
+	electionTimer  *time.Timer
+	heartbeatTimer *time.Timer
+	applyCh        chan ApplyMsg
+	voteCount      int
 }
 
 // return currentTerm and whether this server
@@ -63,6 +71,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	term = rf.curTerm
+	isleader = (rf.curState == Leader)
 	return term, isleader
 }
 
@@ -102,52 +112,6 @@ func (rf *Raft) readPersist(data []byte) {
 
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (2A).
-}
-
-// example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-}
-
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -190,6 +154,94 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) BroadCastHeartbeat(Heartbeat bool) {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		if Heartbeat {
+			go rf.replicateOneRound(i)
+		} else {
+
+		}
+	}
+	ResetTimer(rf.heartbeatTimer, HeartBeatTimeOut)
+}
+
+func (rf *Raft) replicateOneRound(idx int) {
+	if rf.curState != Leader {
+		DPrintf("server[%d] term %d is not leader, cannot send log entry to server[%d]",
+			rf.me, rf.curTerm, idx)
+		return
+	}
+	args := AppendEntryArgs{
+		Term:     rf.curTerm,
+		LeaderId: rf.me,
+	}
+	reply := AppendEntryReply{}
+
+	ok := rf.sendAppendEntry(idx, &args, &reply)
+	if ok {
+		rf.HandleAppendEntryReply(idx, &args, &reply)
+	}
+}
+
+func (rf *Raft) doLeaderElection() {
+	args := RequestVoteArgs{
+		Term:        rf.curTerm,
+		CandidateId: rf.me,
+	}
+
+	DPrintf("server[%d] start leader election at term %d", rf.me, rf.curTerm)
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(idx int) {
+			reply := RequestVoteReply{}
+			DPrintf("server[%d] term %d send request vote to server[%d]...", rf.me, args.Term, idx)
+			ok := rf.sendRequestVote(idx, &args, &reply)
+			if !ok {
+				DPrintf("server[%d] term %d request vote to server[%d] failed...", rf.me, args.Term, idx)
+			} else {
+				rf.handleRequestVoteReply(idx, &args, &reply)
+			}
+		}(i)
+	}
+}
+
+func (rf *Raft) ChangeState(state State) {
+	DPrintf("server[%d] change %s to %s", rf.me, stateString[rf.curState], stateString[state])
+	rf.curState = state
+}
+
+func (rf *Raft) tick() {
+	for !rf.killed() {
+		select {
+		case t := <-rf.electionTimer.C:
+			rf.mu.Lock()
+			DPrintf("server[%d] electionTimer time out term %d State %s time %d",
+				rf.me, rf.curTerm, stateString[rf.curState], t.UnixMilli())
+			rf.ChangeState(Candidate)
+			rf.curState = Candidate
+			rf.curTerm++
+			rf.voteFor = rf.me
+			rf.voteCount = 1
+			rf.doLeaderElection()
+			ResetTimer(rf.electionTimer, randElectionTimeOut())
+			rf.mu.Unlock()
+		case t := <-rf.heartbeatTimer.C:
+			rf.mu.Lock()
+			DPrintf("server[%d] heartbeatTimer time out term %d state %s time %d",
+				rf.me, rf.curTerm, stateString[rf.curState], t.UnixMilli())
+			if rf.curState == Leader {
+				rf.BroadCastHeartbeat(true)
+			}
+			rf.mu.Unlock()
+		}
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -201,15 +253,22 @@ func (rf *Raft) killed() bool {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
+	rf := &Raft{
+		peers:          peers,
+		persister:      persister,
+		me:             me,
+		curState:       Follower,
+		voteFor:        -1,
+		applyCh:        applyCh,
+		electionTimer:  time.NewTimer(randElectionTimeOut()),
+		heartbeatTimer: time.NewTimer(HeartBeatTimeOut),
+		voteCount:      0,
+	}
 
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	go rf.tick()
 	return rf
 }
