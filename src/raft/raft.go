@@ -18,10 +18,13 @@ package raft
 //
 
 import (
+	"bytes"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"6.824/src/labgob"
 	"6.824/src/labrpc"
 )
 
@@ -43,6 +46,12 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type LogEntry struct {
+	Term int
+	Idx  int
+	Cmd  interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -62,6 +71,21 @@ type Raft struct {
 	heartbeatTimer *time.Timer
 	applyCh        chan ApplyMsg
 	voteCount      int
+	log            []LogEntry
+	commitIdx      int
+	lastApplied    int
+	nextIdx        []int // 待发送给每个server的下一条log idx
+	matchIdx       []int // 已经被复制到每个server的最大log idx
+	repCond        []*sync.Cond
+	applyCond      *sync.Cond
+}
+
+func (rf *Raft) LastLogIdx() int {
+	return rf.log[len(rf.log)-1].Idx
+}
+
+func (rf *Raft) LastLogTerm() int {
+	return rf.log[len(rf.log)-1].Term
 }
 
 // return currentTerm and whether this server
@@ -81,13 +105,15 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	// 持久化当前的任期，投票的id，日志
+	e.Encode(rf.curTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -95,19 +121,20 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var CurTerm int
+	var VoteFor int
+	var entry []LogEntry
+
+	if d.Decode(&CurTerm) != nil || d.Decode(&VoteFor) != nil || d.Decode(&entry) != nil {
+		DPrintf("read persist fail....")
+		runtime.Goexit()
+	} else {
+		rf.curTerm = CurTerm
+		rf.voteFor = VoteFor
+		rf.log = entry
+	}
 }
 
 // example RequestVote RPC arguments structure.
@@ -128,11 +155,26 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := (rf.curState == Leader)
+
+	if !isLeader {
+		return index, term, false
+	}
 
 	// Your code here (2B).
-
-	return index, term, isLeader
+	rf.mu.Lock()
+	entry := LogEntry{
+		Idx:  rf.LastLogIdx() + 1,
+		Term: rf.curTerm,
+		Cmd:  command,
+	}
+	rf.log = append(rf.log, entry)
+	DPrintf("server[%d] start cmd %v at idx %d term %d", rf.me, command, rf.LastLogIdx(), rf.LastLogTerm())
+	rf.BroadCastHeartbeat(false)
+	term = rf.LastLogTerm()
+	index = rf.LastLogIdx()
+	rf.mu.Unlock()
+	return index, term, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -162,27 +204,42 @@ func (rf *Raft) BroadCastHeartbeat(Heartbeat bool) {
 		if Heartbeat {
 			go rf.replicateOneRound(i)
 		} else {
-
+			rf.repCond[i].Signal()
 		}
 	}
+	ResetTimer(rf.electionTimer, randElectionTimeOut())
 	ResetTimer(rf.heartbeatTimer, HeartBeatTimeOut)
 }
 
-func (rf *Raft) replicateOneRound(idx int) {
+func (rf *Raft) replicateOneRound(id int) {
+	rf.mu.Lock()
 	if rf.curState != Leader {
 		DPrintf("server[%d] term %d is not leader, cannot send log entry to server[%d]",
-			rf.me, rf.curTerm, idx)
+			rf.me, rf.curTerm, id)
+		rf.mu.Unlock()
 		return
 	}
 	args := AppendEntryArgs{
-		Term:     rf.curTerm,
-		LeaderId: rf.me,
+		Term:            rf.curTerm,
+		LeaderId:        rf.me,
+		LeaderCommitIdx: rf.commitIdx,
 	}
+	if rf.nextIdx[id] > rf.LastLogIdx() { // 不需要发送log给server id
+		args.PrevLogIdx = rf.LastLogIdx()
+	} else {
+		args.PrevLogIdx = rf.nextIdx[id] - 1
+	}
+	args.PrevLogTerm = rf.log[args.PrevLogIdx].Term
+	args.Entry = make([]LogEntry, len(rf.log[args.PrevLogIdx+1:]))
+	copy(args.Entry, rf.log[args.PrevLogIdx+1:])
+	rf.mu.Unlock()
 	reply := AppendEntryReply{}
 
-	ok := rf.sendAppendEntry(idx, &args, &reply)
+	DPrintf("server %d state %s send log to server %d lastlogidx %v prevLogIdx %d nextidx %v logs %v...",
+		rf.me, stateString[rf.curState], id, rf.LastLogIdx(), args.PrevLogIdx, rf.nextIdx[id], args.Entry)
+	ok := rf.sendAppendEntry(id, &args, &reply)
 	if ok {
-		rf.HandleAppendEntryReply(idx, &args, &reply)
+		rf.HandleAppendEntryReply(id, &args, &reply)
 	}
 }
 
@@ -190,7 +247,10 @@ func (rf *Raft) doLeaderElection() {
 	args := RequestVoteArgs{
 		Term:        rf.curTerm,
 		CandidateId: rf.me,
+		LastLogIdx:  rf.LastLogIdx(),
+		LastLogTerm: rf.LastLogTerm(),
 	}
+	rf.persist()
 
 	DPrintf("server[%d] start leader election at term %d", rf.me, rf.curTerm)
 	for i := range rf.peers {
@@ -213,6 +273,31 @@ func (rf *Raft) doLeaderElection() {
 func (rf *Raft) ChangeState(state State) {
 	DPrintf("server[%d] change %s to %s", rf.me, stateString[rf.curState], stateString[state])
 	rf.curState = state
+}
+
+func (rf *Raft) applier() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIdx {
+			rf.applyCond.Wait()
+		}
+		logs := make([]LogEntry, rf.commitIdx-rf.lastApplied)
+		copy(logs, rf.log[rf.lastApplied+1:rf.commitIdx+1])
+		rf.mu.Unlock()
+		for _, entry := range rf.log {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Cmd,
+				CommandIndex: entry.Idx,
+			}
+		}
+		rf.mu.Lock()
+		DPrintf("server[%d] apply entry %d-%d in term %d", rf.me, rf.lastApplied+1, rf.commitIdx, rf.curTerm)
+		if rf.lastApplied < rf.commitIdx {
+			rf.lastApplied = rf.commitIdx
+		}
+		rf.mu.Unlock()
+	}
 }
 
 func (rf *Raft) tick() {
@@ -242,6 +327,23 @@ func (rf *Raft) tick() {
 	}
 }
 
+func (rf *Raft) needReplicateLog(peer int) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.curState == Leader && rf.matchIdx[peer] < rf.LastLogIdx()
+}
+
+func (rf *Raft) replicator(peer int) {
+	rf.repCond[peer].L.Lock()
+	for !rf.killed() {
+		if !rf.needReplicateLog(peer) {
+			rf.repCond[peer].Wait()
+		}
+		rf.replicateOneRound(peer)
+	}
+	rf.repCond[peer].L.Unlock()
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -263,12 +365,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		electionTimer:  time.NewTimer(randElectionTimeOut()),
 		heartbeatTimer: time.NewTimer(HeartBeatTimeOut),
 		voteCount:      0,
+		commitIdx:      0,
+		lastApplied:    0,
+		nextIdx:        make([]int, len(peers)),
+		matchIdx:       make([]int, len(peers)),
+		repCond:        make([]*sync.Cond, len(peers)),
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	rf.log = append(rf.log, LogEntry{Idx: 0, Term: 0, Cmd: nil})
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.applyCond = sync.NewCond(&rf.mu)
+	for i := range peers {
+		if i == me {
+			continue
+		}
+		rf.matchIdx[i] = 0
+		rf.nextIdx[i] = rf.LastLogIdx() + 1
+		rf.repCond[i] = sync.NewCond(&sync.Mutex{})
+		go rf.replicator(i)
+	}
 	go rf.tick()
+	go rf.applier()
 	return rf
 }

@@ -23,6 +23,11 @@ const ElectionTimeOut = time.Millisecond * 250
 
 const HeartBeatTimeOut = time.Millisecond * 100
 
+const (
+	IdxOutRange = -1
+	IdxCommited = -2
+)
+
 /* 生成随机超时时间，在 250ms~500 ms 范围之内 */
 func randElectionTimeOut() time.Duration {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))

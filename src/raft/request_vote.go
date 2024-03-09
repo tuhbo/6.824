@@ -4,6 +4,8 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term        int
 	CandidateId int
+	LastLogIdx  int
+	LastLogTerm int
 }
 
 // example RequestVote RPC reply structure.
@@ -32,6 +34,7 @@ func (rf *Raft) handleRequestVoteReply(idx int, args *RequestVoteArgs, reply *Re
 		rf.curState = Follower
 		rf.voteFor = -1
 		rf.voteCount = 0
+		rf.persist()
 		return
 	}
 
@@ -40,9 +43,19 @@ func (rf *Raft) handleRequestVoteReply(idx int, args *RequestVoteArgs, reply *Re
 		if rf.curState == Candidate && rf.voteCount > len(rf.peers)/2 {
 			DPrintf("server[%d] become leader at term %d", rf.me, rf.curTerm)
 			rf.ChangeState(Leader)
+			for i := range rf.peers {
+				rf.nextIdx[i] = rf.LastLogIdx() + 1
+				rf.matchIdx[i] = 0
+			}
 			rf.BroadCastHeartbeat(true)
 		}
 	}
+}
+
+func (rf *Raft) LogUpToDate(LastLogIdx int, LastLogTerm int) bool {
+	// 任期大的日志新。如果任期相同，日志索引大的新
+	return LastLogTerm > rf.LastLogTerm() ||
+		(LastLogTerm == rf.LastLogTerm() && LastLogIdx >= rf.LastLogIdx())
 }
 
 // example RequestVote RPC handler.
@@ -50,31 +63,55 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("server[%d] receive server[%d] term %d request vote at term %d state %s",
-		rf.me, args.CandidateId, args.Term, rf.curTerm, stateString[rf.curState])
-	reply.Term = rf.curTerm
-	reply.VoteGranted = false
+	DPrintf("server[%d] receive server[%d] term %d request vote "+
+		"args.logidx %d args.logterm %d at term %d state %s lastlogidx %d lastlogterm %d",
+		rf.me, args.CandidateId, args.Term, args.LastLogIdx, args.LastLogTerm,
+		rf.curTerm, stateString[rf.curState], rf.LastLogIdx(), rf.LastLogTerm())
 
 	// 过期的投票请求
 	if args.Term < rf.curTerm {
+		DPrintf("server[%d] state %s term %d expire receive server[%d] args.term %d",
+			rf.me, stateString[rf.curState], rf.curTerm, args.CandidateId, args.Term)
+		reply.Term = rf.curTerm
+		reply.VoteGranted = false
 		return
 	}
 
 	// 只有一票，但已经给别人投票了
 	if args.Term == rf.curTerm && (rf.voteFor != -1 && rf.voteFor != args.CandidateId) {
+		DPrintf("server[%d] state %s term %d has voted for server[%d] cannot vote for server[%d]",
+			rf.me, stateString[rf.curState], rf.curTerm, rf.voteFor, args.CandidateId)
+		reply.Term = rf.curTerm
+		reply.VoteGranted = false
 		return
 	}
 
+	var needPersist bool = false
+
 	if args.Term > rf.curTerm {
+		DPrintf("server[%d]'term %d < server[%d]'term %d", rf.me, rf.curTerm, args.CandidateId, args.Term)
 		rf.ChangeState(Follower)
 		rf.curTerm = args.Term
 		rf.voteFor = -1
+		needPersist = true
+	}
+
+	if !rf.LogUpToDate(args.LastLogIdx, args.LastLogTerm) {
+		DPrintf("server[%d]'log args.LastLogidx %d args.lastlogterm %d is not up to date server[%d] log idx %d log term %d",
+			args.CandidateId, args.LastLogIdx, args.LastLogTerm, rf.me, rf.LastLogIdx(), rf.LastLogTerm())
+		reply.Term = rf.curTerm
+		reply.VoteGranted = false
+		if needPersist {
+			rf.persist()
+		}
+		return
 	}
 
 	rf.voteFor = args.CandidateId
 	ResetTimer(rf.electionTimer, randElectionTimeOut())
 	reply.Term = rf.curTerm
 	reply.VoteGranted = true
+	rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
