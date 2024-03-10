@@ -41,7 +41,7 @@ func (rf *Raft) handleRequestVoteReply(idx int, args *RequestVoteArgs, reply *Re
 	if reply.VoteGranted {
 		rf.voteCount++
 		if rf.curState == Candidate && rf.voteCount > len(rf.peers)/2 {
-			DPrintf("server[%d] become leader at term %d", rf.me, rf.curTerm)
+			DPrintf("server[%d] election success at term %d", rf.me, rf.curTerm)
 			rf.ChangeState(Leader)
 			for i := range rf.peers {
 				rf.nextIdx[i] = rf.LastLogIdx() + 1

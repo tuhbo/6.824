@@ -112,6 +112,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.voteFor)
 	e.Encode(rf.log)
 
+	DPrintf("server[%d] term %d voteFor %d log %v", rf.me, rf.curTerm, rf.voteFor, rf.log)
+
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -134,6 +136,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.curTerm = CurTerm
 		rf.voteFor = VoteFor
 		rf.log = entry
+		DPrintf("server[%d] term %d voteFor %d log %v", rf.me, rf.curTerm, rf.voteFor, rf.log)
 	}
 }
 
@@ -173,6 +176,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.BroadCastHeartbeat(false)
 	term = rf.LastLogTerm()
 	index = rf.LastLogIdx()
+	rf.persist()
 	rf.mu.Unlock()
 	return index, term, true
 }
@@ -250,7 +254,6 @@ func (rf *Raft) doLeaderElection() {
 		LastLogIdx:  rf.LastLogIdx(),
 		LastLogTerm: rf.LastLogTerm(),
 	}
-	rf.persist()
 
 	DPrintf("server[%d] start leader election at term %d", rf.me, rf.curTerm)
 	for i := range rf.peers {
@@ -281,10 +284,11 @@ func (rf *Raft) applier() {
 		for rf.lastApplied >= rf.commitIdx {
 			rf.applyCond.Wait()
 		}
+		commitIdx := rf.commitIdx
 		logs := make([]LogEntry, rf.commitIdx-rf.lastApplied)
 		copy(logs, rf.log[rf.lastApplied+1:rf.commitIdx+1])
 		rf.mu.Unlock()
-		for _, entry := range rf.log {
+		for _, entry := range logs {
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Cmd,
@@ -292,10 +296,8 @@ func (rf *Raft) applier() {
 			}
 		}
 		rf.mu.Lock()
-		DPrintf("server[%d] apply entry %d-%d in term %d", rf.me, rf.lastApplied+1, rf.commitIdx, rf.curTerm)
-		if rf.lastApplied < rf.commitIdx {
-			rf.lastApplied = rf.commitIdx
-		}
+		DPrintf("server[%d] apply entry %d-%d in term %d", rf.me, rf.lastApplied+1, commitIdx, rf.curTerm)
+		rf.lastApplied = max(rf.lastApplied, commitIdx)
 		rf.mu.Unlock()
 	}
 }
@@ -313,6 +315,7 @@ func (rf *Raft) tick() {
 			rf.voteFor = rf.me
 			rf.voteCount = 1
 			rf.doLeaderElection()
+			rf.persist()
 			ResetTimer(rf.electionTimer, randElectionTimeOut())
 			rf.mu.Unlock()
 		case t := <-rf.heartbeatTimer.C:
@@ -373,7 +376,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.log = append(rf.log, LogEntry{Idx: 0, Term: 0, Cmd: nil})
+	rf.log = append(rf.log, LogEntry{Idx: 0, Term: -1, Cmd: nil})
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.applyCond = sync.NewCond(&rf.mu)

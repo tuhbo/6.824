@@ -34,9 +34,11 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntryArgs, reply *App
 		return
 	}
 	if reply.Success {
-		rf.nextIdx[id] = args.PrevLogIdx + len(args.Entry) + 1
-		rf.matchIdx[id] = args.PrevLogIdx + len(args.Entry)
-		DPrintf("server[%d]  server %d'nextIdx %v matchIdx %v...", rf.me, id, rf.nextIdx[id], rf.matchIdx[id])
+		match := args.PrevLogIdx + len(args.Entry)
+		next := match + 1
+		rf.nextIdx[id] = max(rf.nextIdx[id], next)
+		rf.matchIdx[id] = max(rf.matchIdx[id], match)
+		DPrintf("server[%d] server %d'nextIdx %v matchIdx %v match %d next %d...", rf.me, id, rf.nextIdx[id], rf.matchIdx[id], match, next)
 
 		N := rf.commitIdx
 		for i := N + 1; i <= rf.LastLogIdx(); i++ {
@@ -57,8 +59,8 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntryArgs, reply *App
 			rf.applyCond.Signal()
 		}
 	} else {
-		DPrintf("server[%d] receive server[%d] term conflict reply.ConflictTerm %d reply.ConflictIdx %d",
-			rf.me, id, reply.ConflictTerm, reply.ConflictIdx)
+		DPrintf("server[%d] receive server[%d] term conflict reply.ConflictTerm %d reply.ConflictIdx %d log %v",
+			rf.me, id, reply.ConflictTerm, reply.ConflictIdx, rf.log)
 		if reply.ConflictTerm == IdxOutRange || reply.ConflictTerm == IdxCommited {
 			rf.nextIdx[id] = reply.ConflictIdx
 		} else {
@@ -66,7 +68,8 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntryArgs, reply *App
 			for i := rf.LastLogIdx(); i >= 1; i-- {
 				if rf.log[i].Term == reply.ConflictTerm {
 					termNotExist = false
-					rf.nextIdx[id] = i + 1
+					rf.nextIdx[id] = i
+					DPrintf("server[%d] conflictTerm %d idx %d", rf.me, reply.ConflictTerm, i)
 					break
 				}
 
@@ -77,6 +80,7 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntryArgs, reply *App
 			}
 
 			if termNotExist {
+				DPrintf("server[%d] conflictTerm %d not exist", rf.me, reply.ConflictTerm)
 				rf.nextIdx[id] = reply.ConflictIdx
 			}
 		}
@@ -85,9 +89,9 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntryArgs, reply *App
 
 func (rf *Raft) getConflictIdxAndTerm(PrevLogIdx int) (int, int) {
 	conflictTerm := rf.log[PrevLogIdx].Term
-	conflictIdx := 0
-	for i := PrevLogIdx; i >= 0; i-- {
-		if rf.log[i].Term != conflictTerm || i == 0 {
+	conflictIdx := PrevLogIdx
+	for i := PrevLogIdx; i > 0; i-- {
+		if rf.log[i].Term != conflictTerm {
 			conflictIdx = i + 1
 			break
 		}
@@ -110,7 +114,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term := rf.curTerm
-	DPrintf("server[%d] curTerm %d state %s receive server[%d] term %d append entry %v"+
+	DPrintf("server[%d] curTerm %d state %s receive server[%d] term %d append entry %v "+
 		"leadercommit %d PrevLogIdx %d PrevLogTerm %d lastlogidx %d lastlogterm %d commitidx %d",
 		rf.me, term, stateString[rf.curState], args.LeaderId, args.Term, args.Entry, args.LeaderCommitIdx,
 		args.PrevLogIdx, args.PrevLogTerm, rf.LastLogIdx(), rf.LastLogTerm(), rf.commitIdx)
@@ -167,14 +171,32 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		}
 		return
 	}
-
-	rf.log = rf.log[:args.PrevLogIdx+1]
-	rf.log = append(rf.log, args.Entry...)
-	DPrintf("server[%d] logs %v", rf.me, rf.log)
+	DPrintf("server[%d] append before logs %v", rf.me, rf.log)
+	for idx, entry := range args.Entry {
+		// for append entry rpc rule 3
+		if entry.Idx <= rf.LastLogIdx() && rf.log[entry.Idx].Term != entry.Term {
+			rf.log = rf.log[:entry.Idx]
+			needPersist = true
+		}
+		// for append entry rpc rule 4
+		if entry.Idx > rf.LastLogIdx() {
+			rf.log = append(rf.log, args.Entry[idx:]...)
+			needPersist = true
+			break
+		}
+	}
+	// if len(args.Entry) != 0 {
+	// 	rf.log = rf.log[:args.PrevLogIdx+1]
+	// 	rf.log = append(rf.log, args.Entry...)
+	// 	needPersist = true
+	// }
+	DPrintf("server[%d] append after logs %v", rf.me, rf.log)
 	reply.Success = true
 	reply.Term = rf.curTerm
 	rf.AdvanceCommitIdx(args.LeaderCommitIdx)
-	rf.persist()
+	if needPersist {
+		rf.persist()
+	}
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
