@@ -44,6 +44,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	SnapShot     []byte
 }
 
 type LogEntry struct {
@@ -223,27 +224,46 @@ func (rf *Raft) replicateOneRound(id int) {
 		rf.mu.Unlock()
 		return
 	}
-	args := AppendEntryArgs{
-		Term:            rf.curTerm,
-		LeaderId:        rf.me,
-		LeaderCommitIdx: rf.commitIdx,
-	}
-	if rf.nextIdx[id] > rf.LastLogIdx() { // 不需要发送log给server id
-		args.PrevLogIdx = rf.LastLogIdx()
+	baseIdx := rf.log[0].Idx
+	if rf.nextIdx[id]-1 < baseIdx {
+		args := InstallSnapShotArgs{
+			Term:             rf.curTerm,
+			LeaderId:         rf.me,
+			LastIncludedIdx:  baseIdx,
+			LastIncludedTerm: rf.log[0].Term,
+			Snapshot:         rf.persister.ReadSnapshot(),
+		}
+		reply := InstallSnapShotReply{}
+		rf.mu.Unlock()
+		DPrintf("server %d state %s nextidx %d install snapshot to server %d args %v",
+			rf.me, stateString[rf.curState], rf.nextIdx[id], id, args)
+		ok := rf.sendInstallSnapShot(id, &args, &reply)
+		if ok {
+			rf.HandleInstallSnapShot(id, &args, &reply)
+		}
 	} else {
-		args.PrevLogIdx = rf.nextIdx[id] - 1
-	}
-	args.PrevLogTerm = rf.log[args.PrevLogIdx].Term
-	args.Entry = make([]LogEntry, len(rf.log[args.PrevLogIdx+1:]))
-	copy(args.Entry, rf.log[args.PrevLogIdx+1:])
-	rf.mu.Unlock()
-	reply := AppendEntryReply{}
+		args := AppendEntryArgs{
+			Term:            rf.curTerm,
+			LeaderId:        rf.me,
+			LeaderCommitIdx: rf.commitIdx,
+		}
+		if rf.nextIdx[id] > rf.LastLogIdx() { // 不需要发送log给server id
+			args.PrevLogIdx = rf.LastLogIdx()
+		} else {
+			args.PrevLogIdx = rf.nextIdx[id] - 1
+		}
+		args.PrevLogTerm = rf.log[args.PrevLogIdx-baseIdx].Term
+		args.Entry = make([]LogEntry, len(rf.log[args.PrevLogIdx-baseIdx+1:]))
+		copy(args.Entry, rf.log[args.PrevLogIdx-baseIdx+1:])
+		rf.mu.Unlock()
+		reply := AppendEntryReply{}
 
-	DPrintf("server %d state %s send log to server %d lastlogidx %v prevLogIdx %d nextidx %v logs %v...",
-		rf.me, stateString[rf.curState], id, rf.LastLogIdx(), args.PrevLogIdx, rf.nextIdx[id], args.Entry)
-	ok := rf.sendAppendEntry(id, &args, &reply)
-	if ok {
-		rf.HandleAppendEntryReply(id, &args, &reply)
+		DPrintf("server %d state %s send log to server %d lastlogidx %v prevLogIdx %d nextidx %v logs %v...",
+			rf.me, stateString[rf.curState], id, rf.LastLogIdx(), args.PrevLogIdx, rf.nextIdx[id], args.Entry)
+		ok := rf.sendAppendEntry(id, &args, &reply)
+		if ok {
+			rf.HandleAppendEntryReply(id, &args, &reply)
+		}
 	}
 }
 
@@ -285,8 +305,9 @@ func (rf *Raft) applier() {
 			rf.applyCond.Wait()
 		}
 		commitIdx := rf.commitIdx
+		baseIdx := rf.log[0].Idx
 		logs := make([]LogEntry, rf.commitIdx-rf.lastApplied)
-		copy(logs, rf.log[rf.lastApplied+1:rf.commitIdx+1])
+		copy(logs, rf.log[rf.lastApplied-baseIdx+1:rf.commitIdx-baseIdx+1])
 		rf.mu.Unlock()
 		for _, entry := range logs {
 			rf.applyCh <- ApplyMsg{

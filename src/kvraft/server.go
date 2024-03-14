@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -158,24 +160,69 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+/* 辅助函数，读取已持久化的 snapshot */
+func (kv *KVServer) readSnapshot(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+
+	var db map[string]string
+	var clientReq map[int64]int64
+
+	if d.Decode(&db) != nil || d.Decode(&clientReq) != nil {
+		DPrintf("readSnapshot err")
+	} else {
+		kv.db = db
+		kv.clientReq = clientReq
+	}
+}
+
 func (kv *KVServer) Run() {
 	for !kv.killed() {
+		DPrintf("[kvserver] server %d run in...", kv.me)
 		msg := <-kv.applyCh // raft集群已经提交log
+		DPrintf("[kvserver] server %d run out...", kv.me)
 		op := msg.Command.(Op)
 		idx := msg.CommandIndex
 		clientId := op.ClientId
 		cmdIdx := op.CmdIdx
 
-		kv.mu.Lock()
-		if !kv.IsStaleReq(clientId, cmdIdx) { // 老的request不需要更新状态
-			kv.ApplyState(op) // 更新state
-			kv.clientReq[clientId] = cmdIdx
+		if !msg.CommandValid { // follower收到leader的快照
+			r := bytes.NewBuffer(msg.SnapShot)
+			d := gob.NewDecoder(r)
+
+			kv.mu.Lock()
+			kv.db = make(map[string]string)
+			kv.clientReq = make(map[int64]int64)
+			d.Decode(&kv.db)
+			d.Decode(&kv.clientReq)
+			kv.mu.Unlock()
+		} else {
+			kv.mu.Lock()
+			if !kv.IsStaleReq(clientId, cmdIdx) { // 老的request不需要更新状态
+				kv.ApplyState(op) // 更新state
+				kv.clientReq[clientId] = cmdIdx
+			}
+
+			if kv.maxraftstate != -1 && kv.rf.StateSize() > kv.maxraftstate {
+				// 快照信息包括kv.db 和 clientreq
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(kv.db)
+				e.Encode(kv.clientReq)
+
+				snapshot := w.Bytes()
+				kv.rf.SnapShot(idx, snapshot)
+			}
+			ch, ok := kv.waiter[idx]
+			if ok {
+				ch <- op // 唤醒rpc handle，回复client
+			}
+			kv.mu.Unlock()
 		}
-		ch, ok := kv.waiter[idx]
-		if ok {
-			ch <- op // 唤醒rpc handle，回复client
-		}
-		kv.mu.Unlock()
 	}
 }
 
@@ -209,6 +256,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.clientReq = make(map[int64]int64)
 
 	// You may need initialization code here.
+	kv.readSnapshot(persister.ReadSnapshot())
 	go kv.Run()
 	return kv
 }
