@@ -33,18 +33,19 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntryArgs, reply *App
 		rf.persist()
 		return
 	}
+	baseIdx := rf.log[0].Idx
 	if reply.Success {
 		match := args.PrevLogIdx + len(args.Entry)
 		next := match + 1
 		rf.nextIdx[id] = max(rf.nextIdx[id], next)
 		rf.matchIdx[id] = max(rf.matchIdx[id], match)
-		DPrintf("server[%d] server %d'nextIdx %v matchIdx %v match %d next %d...", rf.me, id, rf.nextIdx[id], rf.matchIdx[id], match, next)
+		DPrintf("server[%d] server %d'nextIdx %v matchIdx %v match %d next %d baseIdx %d...", rf.me, id, rf.nextIdx[id], rf.matchIdx[id], match, next, baseIdx)
 
 		N := rf.commitIdx
 		for i := N + 1; i <= rf.LastLogIdx(); i++ {
 			cnt := 1
 			for id := range rf.peers {
-				if id != rf.me && rf.matchIdx[id] >= i && rf.log[i].Term == rf.curTerm {
+				if id != rf.me && rf.matchIdx[id] >= i && rf.log[i-baseIdx].Term == rf.curTerm {
 					cnt++
 				}
 			}
@@ -65,8 +66,8 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntryArgs, reply *App
 			rf.nextIdx[id] = reply.ConflictIdx
 		} else {
 			termNotExist := true
-			for i := rf.LastLogIdx(); i >= 1; i-- {
-				if rf.log[i].Term == reply.ConflictTerm {
+			for i := rf.LastLogIdx(); i > baseIdx; i-- {
+				if rf.log[i-baseIdx].Term == reply.ConflictTerm {
 					termNotExist = false
 					rf.nextIdx[id] = i
 					DPrintf("server[%d] conflictTerm %d idx %d", rf.me, reply.ConflictTerm, i)
@@ -74,7 +75,7 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntryArgs, reply *App
 				}
 
 				// i之前的term肯定比reply.ConflictTerm都小
-				if rf.log[i].Term < reply.ConflictTerm {
+				if rf.log[i-baseIdx].Term < reply.ConflictTerm {
 					break
 				}
 			}
@@ -88,11 +89,12 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntryArgs, reply *App
 }
 
 func (rf *Raft) getConflictIdxAndTerm(PrevLogIdx int) (int, int) {
-	conflictTerm := rf.log[PrevLogIdx].Term
+	baseIdx := rf.log[0].Idx
+	conflictTerm := rf.log[PrevLogIdx-baseIdx].Term
 	conflictIdx := PrevLogIdx
-	for i := PrevLogIdx; i > 0; i-- {
+	for i := PrevLogIdx - baseIdx; i >= 0; i-- {
 		if rf.log[i].Term != conflictTerm {
-			conflictIdx = i + 1
+			conflictIdx = rf.log[i+1].Idx
 			break
 		}
 	}
@@ -159,8 +161,21 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		}
 		return
 	}
+	baseIdx := rf.log[0].Idx
+	if args.PrevLogIdx < baseIdx { //snapshot之前的日志已经提交，不能覆盖
+		DPrintf("server[%d] state %s receive server[%d] prevlogidx %d cann't cover snap idx %d",
+			rf.me, stateString[rf.curState], args.PrevLogIdx, baseIdx)
+		reply.Success = false
+		reply.Term = rf.curTerm
+		reply.ConflictIdx = baseIdx + 1
+		reply.ConflictTerm = IdxCommited
+		if needPersist {
+			rf.persist()
+		}
+		return
+	}
 
-	if rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
+	if rf.log[args.PrevLogIdx-baseIdx].Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.curTerm
 		// 往前查找与冲突点term相同的第一条日志的idx
@@ -174,8 +189,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	DPrintf("server[%d] append before logs %v", rf.me, rf.log)
 	for idx, entry := range args.Entry {
 		// for append entry rpc rule 3
-		if entry.Idx <= rf.LastLogIdx() && rf.log[entry.Idx].Term != entry.Term {
-			rf.log = rf.log[:entry.Idx]
+		if entry.Idx <= rf.LastLogIdx() && rf.log[entry.Idx-baseIdx].Term != entry.Term {
+			rf.log = rf.log[:(entry.Idx - baseIdx)]
 			needPersist = true
 		}
 		// for append entry rpc rule 4
