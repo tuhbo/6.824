@@ -185,10 +185,6 @@ func (kv *KVServer) Run() {
 		DPrintf("[kvserver] server %d run in...", kv.me)
 		msg := <-kv.applyCh // raft集群已经提交log
 		DPrintf("[kvserver] server %d run out...", kv.me)
-		op := msg.Command.(Op)
-		idx := msg.CommandIndex
-		clientId := op.ClientId
-		cmdIdx := op.CmdIdx
 
 		if !msg.CommandValid { // follower收到leader的快照
 			r := bytes.NewBuffer(msg.SnapShot)
@@ -201,6 +197,10 @@ func (kv *KVServer) Run() {
 			d.Decode(&kv.clientReq)
 			kv.mu.Unlock()
 		} else {
+			op := msg.Command.(Op)
+			idx := msg.CommandIndex
+			clientId := op.ClientId
+			cmdIdx := op.CmdIdx
 			kv.mu.Lock()
 			if !kv.IsStaleReq(clientId, cmdIdx) { // 老的request不需要更新状态
 				kv.ApplyState(op) // 更新state

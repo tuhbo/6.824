@@ -137,6 +137,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.curTerm = CurTerm
 		rf.voteFor = VoteFor
 		rf.log = entry
+		rf.commitIdx, rf.lastApplied = rf.log[0].Idx, rf.log[0].Idx
 		DPrintf("server[%d] term %d voteFor %d log %v", rf.me, rf.curTerm, rf.voteFor, rf.log)
 	}
 }

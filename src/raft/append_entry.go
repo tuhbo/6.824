@@ -39,7 +39,8 @@ func (rf *Raft) HandleAppendEntryReply(id int, args *AppendEntryArgs, reply *App
 		next := match + 1
 		rf.nextIdx[id] = max(rf.nextIdx[id], next)
 		rf.matchIdx[id] = max(rf.matchIdx[id], match)
-		DPrintf("server[%d] server %d'nextIdx %v matchIdx %v match %d next %d baseIdx %d...", rf.me, id, rf.nextIdx[id], rf.matchIdx[id], match, next, baseIdx)
+		DPrintf("server[%d] server %d'nextIdx %v matchIdx %v match %d next %d baseIdx %d commitidx %d...",
+			rf.me, id, rf.nextIdx[id], rf.matchIdx[id], match, next, baseIdx, rf.commitIdx)
 
 		N := rf.commitIdx
 		for i := N + 1; i <= rf.LastLogIdx(); i++ {
