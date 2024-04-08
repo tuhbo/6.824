@@ -10,11 +10,14 @@ import (
 	"time"
 
 	"6.824/src/labrpc"
+	"6.824/src/raft"
 )
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	clientId int64
+	cmdIdx   int64
 }
 
 func nrand() int64 {
@@ -28,6 +31,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.clientId = nrand()
+	ck.cmdIdx = 0
 	return ck
 }
 
@@ -49,18 +54,23 @@ func (ck *Clerk) Query(num int) Config {
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
-	// Your code here.
-	args.Servers = servers
+	args := &JoinArgs{
+		Servers:  servers,
+		ClientId: ck.clientId,
+		CmdIdx:   ck.cmdIdx,
+	}
+	ck.cmdIdx++
 
 	for {
 		// try each known server.
-		for _, srv := range ck.servers {
+		for i, srv := range ck.servers {
 			var reply JoinReply
+			raft.DPrintf("clientid %d send join cmdidx %d %v to server[%d]", ck.clientId, ck.cmdIdx, servers, i)
 			ok := srv.Call("ShardMaster.Join", args, &reply)
 			if ok && reply.WrongLeader == false {
 				return
 			}
+			raft.DPrintf("clientid %d send join cmdidx %d %v to server[%d] failed...", ck.clientId, ck.cmdIdx, servers, i)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
