@@ -1,6 +1,7 @@
 package shardmaster
 
 import (
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,12 +32,15 @@ type Op struct {
 	Cmd      string
 	Servers  map[int][]string // new GID -> servers mappings, for Join op
 	GIDs     []int            // for leave op
+	GID      int              // for move op
+	Shard    int              // for move op
+	Num      int              // for query op
 }
 
 func (sm *ShardMaster) SubmitLog(op Op) bool {
 	idx, _, isLeader := sm.rf.Start(op)
 	if !isLeader {
-		raft.DPrintf("server %d is not leader op %s failed", sm.me, op.Cmd)
+		DPrintf("server %d is not leader op %s failed", sm.me, op.Cmd)
 		return false
 	}
 
@@ -84,19 +88,69 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 		reply.WrongLeader = true
 		return
 	}
-
 }
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
+	op := Op{
+		ClientId: args.ClientId,
+		Cmd:      "Leave",
+		CmdIdx:   args.CmdIdx,
+		GIDs:     args.GIDs,
+	}
+	ok := sm.SubmitLog(op)
+	reply.WrongLeader = false
+	if !ok {
+		reply.WrongLeader = true
+		return
+	}
 }
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
+	op := Op{
+		ClientId: args.ClientId,
+		Cmd:      "Move",
+		CmdIdx:   args.CmdIdx,
+		GID:      args.GID,
+		Shard:    args.Shard,
+	}
+	ok := sm.SubmitLog(op)
+	reply.WrongLeader = false
+	if !ok {
+		reply.WrongLeader = true
+		return
+	}
 }
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
+	op := Op{
+		ClientId: args.ClientId,
+		Cmd:      "Query",
+		CmdIdx:   args.CmdIdx,
+		Num:      args.Num,
+	}
+	ok := sm.SubmitLog(op)
+	reply.WrongLeader = false
+	if !ok {
+		reply.WrongLeader = true
+		return
+	}
+	sm.mu.Lock()
+	if args.Num == -1 || args.Num >= len(sm.configs) {
+		args.Num = len(sm.configs) - 1
+	}
+	config := sm.configs[args.Num]
+	reply.Config = Config{
+		Num:    config.Num,
+		Shards: config.Shards,
+	}
+	reply.Config.Groups = make(map[int][]string)
+	for gid, servers := range config.Groups {
+		reply.Config.Groups[gid] = servers
+	}
+	sm.mu.Unlock()
 }
 
 // the tester calls Kill() when a ShardMaster instance won't
@@ -119,25 +173,178 @@ func (sm *ShardMaster) Raft() *raft.Raft {
 	return sm.rf
 }
 
-func (sm *ShardMaster) JoinHandle(servers map[int][]string) {
-	sm.mu.Lock()
-	lastConfig := sm.configs[len(sm.configs)-1]
+func GetGroup2Shard(config Config) map[int][]int {
+	g2s := make(map[int][]int, len(config.Groups))
+	for gid, _ := range config.Groups {
+		g2s[gid] = make([]int, 0)
+	}
+	for shard, gid := range config.Shards {
+		g2s[gid] = append(g2s[gid], shard)
+	}
+	return g2s
+}
 
-	sm.mu.Unlock()
+func GetGidWithMinShards(g2s map[int][]int) int {
+	var gids []int
+	for gid, _ := range g2s {
+		gids = append(gids, gid)
+	}
+	sort.Ints(gids)
+	DPrintf("g2s %v gids %v", g2s, gids)
+	res, min := -1, NShards+1
+	for _, gid := range gids {
+		if gid != 0 && len(g2s[gid]) < min {
+			res, min = gid, len(g2s[gid])
+		}
+	}
+	return res
+}
+
+func GetGidWithMaxShards(g2s map[int][]int) int {
+	// 0号group，有shards，返回0号group
+	if shards, ok := g2s[0]; ok && len(shards) > 0 {
+		DPrintf("0 group has shards %v", g2s)
+		return 0
+	}
+	var gids []int
+	for gid, _ := range g2s {
+		gids = append(gids, gid)
+	}
+	sort.Ints(gids)
+	res, max := -1, -1
+	for _, gid := range gids {
+		if len(g2s[gid]) > max {
+			res, max = gid, len(g2s[gid])
+		}
+	}
+	return res
+}
+
+func (sm *ShardMaster) JoinHandle(groups map[int][]string) {
+	lastConfig := sm.configs[len(sm.configs)-1]
+	DPrintf("[shardMaste] server %d join handle lastConfig %v add groups %v", sm.me, lastConfig, groups)
+	// 生成新的配置
+	newConfig := Config{
+		Num:    len(sm.configs),
+		Shards: lastConfig.Shards,
+	}
+	newGroups := make(map[int][]string, len(lastConfig.Groups))
+	for k, v := range lastConfig.Groups {
+		newGroups[k] = v
+	}
+	newConfig.Groups = newGroups
+
+	for gid, servers := range groups {
+		if _, ok := newConfig.Groups[gid]; !ok {
+			newServers := make([]string, len(servers))
+			copy(newServers, servers)
+			newConfig.Groups[gid] = newServers
+		}
+	}
+
+	// 从shard最多的group移动一个shard到分片最少的group
+	g2s := GetGroup2Shard(newConfig)
+	for {
+		source := GetGidWithMaxShards(g2s)
+		target := GetGidWithMinShards(g2s)
+		DPrintf("source %d target %d", source, target)
+		if source != 0 && len(g2s[source])-len(g2s[target]) <= 1 {
+			break
+		}
+		g2s[target] = append(g2s[target], g2s[source][0])
+		g2s[source] = g2s[source][1:]
+	}
+	var newShards [NShards]int
+	for gid, shards := range g2s {
+		for _, shard := range shards {
+			newShards[shard] = gid
+		}
+	}
+	newConfig.Shards = newShards
+	sm.configs = append(sm.configs, newConfig)
+}
+
+func (sm *ShardMaster) LeaveHandle(gids []int) {
+	lastConfig := sm.configs[len(sm.configs)-1]
+	DPrintf("[shardMaste] server %d leave handle"+
+		" lastConfig %v leave gids %v",
+		sm.me, lastConfig, gids)
+	// 生成新的配置
+	newConfig := Config{
+		Num:    len(sm.configs),
+		Shards: lastConfig.Shards,
+	}
+	newGroups := make(map[int][]string, len(lastConfig.Groups))
+	for k, v := range lastConfig.Groups {
+		newGroups[k] = v
+	}
+	newConfig.Groups = newGroups
+
+	g2s := GetGroup2Shard(newConfig)
+	// 记录删除的group有哪些shard
+	var deletedGroupShards []int
+	for _, gid := range gids {
+		if _, ok := newConfig.Groups[gid]; ok {
+			delete(newConfig.Groups, gid)
+		}
+
+		if shards, ok := g2s[gid]; ok {
+			deletedGroupShards = append(deletedGroupShards, shards...)
+			delete(g2s, gid)
+		}
+	}
+
+	var newShards [NShards]int
+	// 如果集群没有raft group，那么所有shard都归属于0 group
+	if len(newConfig.Groups) != 0 {
+		for _, shard := range deletedGroupShards {
+			target := GetGidWithMinShards(g2s)
+			g2s[target] = append(g2s[target], shard)
+		}
+		for gid, shards := range g2s {
+			for _, shard := range shards {
+				newShards[shard] = gid
+			}
+		}
+	}
+	newConfig.Shards = newShards
+	sm.configs = append(sm.configs, newConfig)
+}
+
+func (sm *ShardMaster) MoveHandle(Gid int, Shard int) {
+	lastConfig := sm.configs[len(sm.configs)-1]
+	DPrintf("[shardMaste] server %d move handle"+
+		" lastConfig %v move shard %d to gid %d",
+		sm.me, lastConfig, Shard, Gid)
+	// 生成新的配置
+	newConfig := Config{
+		Num:    len(sm.configs),
+		Shards: lastConfig.Shards,
+	}
+	newGroups := make(map[int][]string, len(lastConfig.Groups))
+	for k, v := range lastConfig.Groups {
+		newGroups[k] = v
+	}
+	newConfig.Groups = newGroups
+
+	var newShards [NShards]int = newConfig.Shards
+	newShards[Shard] = Gid
+	newConfig.Shards = newShards
+	sm.configs = append(sm.configs, newConfig)
 }
 
 func (sm *ShardMaster) ApplyState(op Op) {
 	switch op.Cmd {
 	case "Join":
-		break
+		sm.JoinHandle(op.Servers)
 	case "Leave":
-		break
+		sm.LeaveHandle(op.GIDs)
 	case "Move":
-		break
+		sm.MoveHandle(op.GID, op.Shard)
 	case "Query":
 		break
 	default:
-		raft.DPrintf("[shardmaster] server %d unknow op %s", sm.me, op.Cmd)
+		DPrintf("[shardmaster] server %d unknow op %s", sm.me, op.Cmd)
 	}
 }
 
@@ -151,9 +358,9 @@ func (sm *ShardMaster) IsStaleReq(clientId int64, cmdIdx int64) bool {
 
 func (sm *ShardMaster) Run() {
 	for !sm.Killed() {
-		raft.DPrintf("[shardmaster] server %d run in...", sm.me)
+		DPrintf("[shardmaster] server %d run in...", sm.me)
 		msg := <-sm.applyCh // raft集群已经提交log
-		raft.DPrintf("[shardmaster] server %d run out...", sm.me)
+		DPrintf("[shardmaster] server %d run out...", sm.me)
 
 		op := msg.Command.(Op)
 		idx := msg.CommandIndex
@@ -186,8 +393,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	labgob.Register(Op{})
 	sm.applyCh = make(chan raft.ApplyMsg)
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
-
+	sm.waiter = make(map[int]chan Op)
+	sm.clientReq = make(map[int64]int64)
 	// Your code here.
+	go sm.Run()
 
 	return sm
 }

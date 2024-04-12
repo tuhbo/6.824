@@ -1,5 +1,7 @@
 package shardmaster
 
+import "github.com/zeromicro/go-zero/core/logx"
+
 //
 // Master shard server: assigns shards to replication groups.
 //
@@ -46,7 +48,9 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs     []int
+	ClientId int64
+	CmdIdx   int64
 }
 
 type LeaveReply struct {
@@ -55,8 +59,10 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard    int
+	GID      int
+	ClientId int64
+	CmdIdx   int64
 }
 
 type MoveReply struct {
@@ -65,11 +71,22 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num      int // desired config number
+	ClientId int64
+	CmdIdx   int64
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+const Debug = 0
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		logx.WithCallerSkip(1).Debugf(format, a...)
+	}
+	return
 }
