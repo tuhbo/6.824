@@ -41,6 +41,9 @@ type Clerk struct {
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	leaderIds map[int]int
+	clientId  int64
+	cmdIdx    int64
 }
 
 // the tester calls MakeClerk.
@@ -55,6 +58,9 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.cmdIdx = 0
+	ck.leaderIds = make(map[int]int)
 	return ck
 }
 
@@ -63,25 +69,40 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	args := GetArgs{
+		Key:      key,
+		ClientId: ck.clientId,
+		CmdIdx:   ck.cmdIdx,
+	}
+	ck.cmdIdx++
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
+			if _, ok = ck.leaderIds[gid]; !ok {
+				ck.leaderIds[gid] = 0
+			}
+			oldLeaderId := ck.leaderIds[gid]
+			newLeaderId := oldLeaderId
+			for {
 				var reply GetReply
-				ok := srv.Call("ShardKV.Get", &args, &reply)
+				ok := ck.make_end(servers[newLeaderId]).Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					DPrintf("client %d get key %s success from server %d %v", ck.clientId, key, newLeaderId, reply.Err)
+					ck.leaderIds[gid] = newLeaderId
 					return reply.Value
-				}
-				if ok && (reply.Err == ErrWrongGroup) {
+				} else if ok && (reply.Err == ErrWrongGroup) {
+					DPrintf("client %d get key %s wrong group %d server %d", ck.clientId, key, gid, newLeaderId)
 					break
+				} else {
+					DPrintf("client %d get key %s wrong leader %d", ck.clientId, key, newLeaderId)
+					newLeaderId = (newLeaderId + 1) % len(servers)
+					if newLeaderId == oldLeaderId {
+						break
+					}
 				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -95,26 +116,46 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 // You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
+	args := PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClientId: ck.clientId,
+		CmdIdx:   ck.cmdIdx,
+	}
+	ck.cmdIdx++
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
+			if _, ok = ck.leaderIds[gid]; !ok {
+				ck.leaderIds[gid] = 0
+			}
+			oldLeaderId := ck.leaderIds[gid]
+			newLeaderId := oldLeaderId
+			for {
 				var reply PutAppendReply
-				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+				DPrintf("[client %d --> server %d] PutAppend key %s value %s op %s",
+					ck.clientId, newLeaderId, key, value, op)
+				ok := ck.make_end(servers[newLeaderId]).Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
+					DPrintf("client %d PutAppend key %s value %s op %s to server %d success",
+						ck.clientId, key, value, op, newLeaderId)
+					ck.leaderIds[gid] = newLeaderId
 					return
-				}
-				if ok && reply.Err == ErrWrongGroup {
+				} else if ok && reply.Err == ErrWrongGroup {
+					DPrintf("client %d PutAppend key %s value %s op %s to server %d failed wrong group %d",
+						ck.clientId, key, value, op, newLeaderId, gid)
 					break
+				} else {
+					DPrintf("client %d PutAppend key %s value %s op %s to server %d failed wrong leader",
+						ck.clientId, key, value, op, newLeaderId)
+					newLeaderId = (newLeaderId + 1) % len(servers)
+					if newLeaderId == oldLeaderId {
+						break
+					}
 				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
