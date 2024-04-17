@@ -36,35 +36,38 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	dead      int32             // set by Kill()
-	db        map[string]string // 状态机
-	waiter    map[int]chan Op   // 用于每条op提交log
-	clientReq map[int64]int64   // 记录clientId已经完成的最新的请求ID
-	mck       *shardmaster.Clerk
-	conf      shardmaster.Config
+	dead          int32 // set by Kill()
+	stateMachines map[int]*Shard
+	clientReq     map[int64]ClientRequestContext //记录clientId已经完成的最新的请求ID
+	waiter        map[int]chan *CommonReply      // 用于每条op提交log
+	mck           *shardmaster.Clerk
+	lastConf      shardmaster.Config
+	curConf       shardmaster.Config
 }
 
-func (kv *ShardKV) SubmitLog(op Op) bool {
-	idx, _, isLeader := kv.rf.Start(op)
+func (kv *ShardKV) SubmitLog(event LogEvent, reply *CommonReply) {
+	idx, _, isLeader := kv.rf.Start(event)
 	if !isLeader {
-		DPrintf("server %d is not leader op %s failed", kv.me, op.Cmd)
-		return false
+		DPrintf("server %d is not leader event %s failed", kv.me, event)
+		reply.Err = ErrWrongLeader
+		return
 	}
 
 	kv.mu.Lock()
 	ch, ok := kv.waiter[idx] // 创建一个waiter，用于等待raft提交log
 	if !ok {
-		ch = make(chan Op, 1)
+		ch = make(chan *CommonReply, 1)
 		kv.waiter[idx] = ch
 	}
 	kv.mu.Unlock()
 
 	// 同步等待raft提交log
 	var ret bool
+	var res *CommonReply
 	timer := time.NewTimer(time.Millisecond * 1000)
 	select {
-	case entry := <-ch:
-		ret = (entry == op)
+	case res = <-ch:
+		ret = true
 	case <-timer.C: // 超时1s返回
 		ret = false
 	}
@@ -72,7 +75,13 @@ func (kv *ShardKV) SubmitLog(op Op) bool {
 	kv.mu.Lock()
 	delete(kv.waiter, idx)
 	kv.mu.Unlock()
-	return ret
+	timer.Stop()
+
+	if !ret {
+		reply.Err = ErrWrongLeader
+	} else {
+		reply = res
+	}
 }
 
 func (kv *ShardKV) ApplyState(op Op) {
@@ -85,63 +94,29 @@ func (kv *ShardKV) ApplyState(op Op) {
 }
 
 func (kv *ShardKV) IsStaleReq(clientId int64, cmdIdx int64) bool {
-	completedCmdIdx, ok := kv.clientReq[clientId]
+	reply, ok := kv.clientReq[clientId]
 	if !ok {
 		return false
 	}
-	return cmdIdx <= completedCmdIdx
+	return cmdIdx <= reply.ReqSeq
 }
 
-func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+func (kv *ShardKV) CommonClientRequest(args *CommonClientReq, reply *CommonReply) {
 	kv.mu.Lock()
-	if !kv.canServe(key2shard(args.Key)) {
+	if args.Op != OpGet && kv.IsStaleReq(args.ClientId, args.ReqSeq) {
+		lastReplyContext := kv.clientReq[args.ClientId]
+		*reply = lastReplyContext.reply
 		kv.mu.Unlock()
+		return
+	}
+	if !kv.canServe(key2shard(args.Key)) {
 		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
 		return
 	}
 	kv.mu.Unlock()
-	op := Op{
-		Key:      args.Key,
-		ClientId: args.ClientId,
-		Cmd:      "Get",
-		CmdIdx:   args.CmdIdx,
-	}
-	ok := kv.SubmitLog(op)
-	if !ok {
-		reply.Err = ErrWrongLeader
-		reply.Value = ""
-		return
-	}
 
-	kv.mu.Lock()
-	val, ok := kv.db[args.Key]
-	kv.mu.Unlock()
-	if !ok {
-		reply.Err = ErrNoKey
-		reply.Value = ""
-		return
-	}
-	reply.Err = OK
-	reply.Value = val
-}
-
-func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	op := Op{
-		Key:      args.Key,
-		Value:    args.Value,
-		ClientId: args.ClientId,
-		Cmd:      args.Op,
-		CmdIdx:   args.CmdIdx,
-	}
-
-	ok := kv.SubmitLog(op)
-	if !ok {
-		reply.Err = ErrWrongLeader
-	} else {
-		reply.Err = OK
-	}
+	kv.SubmitLog(NewLogEvent(ClientRequest, *args), reply)
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -168,24 +143,24 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := gob.NewDecoder(r)
 
-	var db map[string]string
-	var clientReq map[int64]int64
+	var stateMachines map[int]*Shard
+	var clientReq map[int64]ClientRequestContext
 
-	if d.Decode(&db) != nil || d.Decode(&clientReq) != nil {
+	if d.Decode(&stateMachines) != nil || d.Decode(&clientReq) != nil {
 		DPrintf("readSnapshot err")
 	} else {
-		kv.db = db
+		kv.stateMachines = stateMachines
 		kv.clientReq = clientReq
 	}
 }
 
 func (kv *ShardKV) canServe(shardId int) bool {
-	return kv.conf.Shards[shardId] == kv.gid
+	return kv.curConf.Shards[shardId] == kv.gid
 }
 
 func (kv *ShardKV) checkCfgChange() (shardmaster.Config, bool) {
 	config := kv.mck.Query(-1)
-	if config.Num != kv.conf.Num {
+	if config.Num != kv.curConf.Num {
 		return config, true
 	}
 	return config, false
@@ -195,14 +170,14 @@ func (kv *ShardKV) PollCfg() {
 	for !kv.killed() {
 		if cfg, changed := kv.checkCfgChange(); changed {
 			kv.mu.Lock()
-			kv.conf = cfg
+			kv.curConf = cfg
 			kv.mu.Unlock()
 		}
 		time.Sleep(PollCfgTimeOut)
 	}
 }
 
-func (kv *ShardKV) Run() {
+func (kv *ShardKV) Apply() {
 	for !kv.killed() {
 		msg := <-kv.applyCh // raft集群已经提交log
 
@@ -211,13 +186,13 @@ func (kv *ShardKV) Run() {
 			d := gob.NewDecoder(r)
 
 			kv.mu.Lock()
-			kv.db = make(map[string]string)
-			kv.clientReq = make(map[int64]int64)
-			d.Decode(&kv.db)
+			kv.stateMachines = make(map[int]*Shard)
+			kv.clientReq = make(map[int64]ClientRequestContext)
+			d.Decode(&kv.stateMachines)
 			d.Decode(&kv.clientReq)
 			kv.mu.Unlock()
 		} else {
-			op := msg.Command.(Op)
+			event := msg.Command.(LogEvent)
 			idx := msg.CommandIndex
 			clientId := op.ClientId
 			cmdIdx := op.CmdIdx
@@ -231,7 +206,7 @@ func (kv *ShardKV) Run() {
 				// 快照信息包括kv.db 和 clientreq
 				w := new(bytes.Buffer)
 				e := labgob.NewEncoder(w)
-				e.Encode(kv.db)
+				e.Encode(kv.stateMachines)
 				e.Encode(kv.clientReq)
 
 				snapshot := w.Bytes()
@@ -289,15 +264,16 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Use something like this to talk to the shardmaster:
 	kv.mck = shardmaster.MakeClerk(kv.masters)
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.waiter = make(map[int]chan Op)
-	kv.clientReq = make(map[int64]int64)
-	kv.db = make(map[string]string)
-	kv.conf = shardmaster.Config{}
+	kv.waiter = make(map[int]chan *CommonReply)
+	kv.clientReq = make(map[int64]ClientRequestContext)
+	kv.stateMachines = make(map[int]*Shard)
+	kv.lastConf = shardmaster.Config{}
+	kv.curConf = shardmaster.Config{}
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.readSnapshot(persister.ReadSnapshot())
 
 	go kv.PollCfg()
-	go kv.Run()
+	go kv.Apply()
 
 	return kv
 }
