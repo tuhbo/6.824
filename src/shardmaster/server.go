@@ -35,13 +35,14 @@ type Op struct {
 	GID      int              // for move op
 	Shard    int              // for move op
 	Num      int              // for query op
+	Conf     Config
 }
 
-func (sm *ShardMaster) SubmitLog(op Op) bool {
+func (sm *ShardMaster) SubmitLog(op Op) (bool, Op) {
 	idx, _, isLeader := sm.rf.Start(op)
 	if !isLeader {
 		DPrintf("server %d is not leader op %s failed", sm.me, op.Cmd)
-		return false
+		return false, Op{}
 	}
 
 	sm.mu.Lock()
@@ -54,9 +55,10 @@ func (sm *ShardMaster) SubmitLog(op Op) bool {
 
 	// 同步等待raft提交log
 	var ret bool
+	var entry Op
 	timer := time.NewTimer(time.Millisecond * 1000)
 	select {
-	case entry := <-ch:
+	case entry = <-ch:
 		if entry.ClientId != op.ClientId ||
 			entry.Cmd != op.Cmd ||
 			entry.CmdIdx != op.CmdIdx {
@@ -71,7 +73,7 @@ func (sm *ShardMaster) SubmitLog(op Op) bool {
 	delete(sm.waiter, idx)
 	sm.mu.Unlock()
 	timer.Stop()
-	return ret
+	return ret, entry
 }
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
@@ -82,12 +84,22 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 		CmdIdx:   args.CmdIdx,
 		Servers:  args.Servers,
 	}
-	ok := sm.SubmitLog(op)
+	ok, _ := sm.SubmitLog(op)
 	reply.WrongLeader = false
 	if !ok {
 		reply.WrongLeader = true
 		return
 	}
+}
+
+func deepCopy(groups map[int][]string) map[int][]string {
+	newGroups := make(map[int][]string)
+	for gid, servers := range groups {
+		newServers := make([]string, len(servers))
+		copy(newServers, servers)
+		newGroups[gid] = newServers
+	}
+	return newGroups
 }
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
@@ -98,7 +110,7 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 		CmdIdx:   args.CmdIdx,
 		GIDs:     args.GIDs,
 	}
-	ok := sm.SubmitLog(op)
+	ok, _ := sm.SubmitLog(op)
 	reply.WrongLeader = false
 	if !ok {
 		reply.WrongLeader = true
@@ -115,7 +127,7 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 		GID:      args.GID,
 		Shard:    args.Shard,
 	}
-	ok := sm.SubmitLog(op)
+	ok, _ := sm.SubmitLog(op)
 	reply.WrongLeader = false
 	if !ok {
 		reply.WrongLeader = true
@@ -125,32 +137,38 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
+	if _, isLeader := sm.rf.GetState(); !isLeader {
+		reply.WrongLeader = true
+		return
+	}
+	sm.mu.Lock()
+	if args.Num >= 0 && args.Num < len(sm.configs) {
+		reply.WrongLeader = false
+		reply.Config.Num = sm.configs[args.Num].Num
+		reply.Config.Shards = sm.configs[args.Num].Shards
+		reply.Config.Groups = deepCopy(sm.configs[args.Num].Groups)
+		sm.mu.Unlock()
+		return
+	}
+	sm.mu.Unlock()
 	op := Op{
 		ClientId: args.ClientId,
 		Cmd:      "Query",
 		CmdIdx:   args.CmdIdx,
 		Num:      args.Num,
 	}
-	ok := sm.SubmitLog(op)
+	ok, entry := sm.SubmitLog(op)
 	reply.WrongLeader = false
 	if !ok {
 		reply.WrongLeader = true
 		return
 	}
-	sm.mu.Lock()
-	if args.Num == -1 || args.Num >= len(sm.configs) {
-		args.Num = len(sm.configs) - 1
-	}
-	config := sm.configs[args.Num]
+	config := entry.Conf
 	reply.Config = Config{
 		Num:    config.Num,
 		Shards: config.Shards,
+		Groups: deepCopy(config.Groups),
 	}
-	reply.Config.Groups = make(map[int][]string)
-	for gid, servers := range config.Groups {
-		reply.Config.Groups[gid] = servers
-	}
-	sm.mu.Unlock()
 }
 
 // the tester calls Kill() when a ShardMaster instance won't
@@ -227,12 +245,8 @@ func (sm *ShardMaster) JoinHandle(groups map[int][]string) {
 	newConfig := Config{
 		Num:    len(sm.configs),
 		Shards: lastConfig.Shards,
+		Groups: deepCopy(lastConfig.Groups),
 	}
-	newGroups := make(map[int][]string, len(lastConfig.Groups))
-	for k, v := range lastConfig.Groups {
-		newGroups[k] = v
-	}
-	newConfig.Groups = newGroups
 
 	for gid, servers := range groups {
 		if _, ok := newConfig.Groups[gid]; !ok {
@@ -273,12 +287,8 @@ func (sm *ShardMaster) LeaveHandle(gids []int) {
 	newConfig := Config{
 		Num:    len(sm.configs),
 		Shards: lastConfig.Shards,
+		Groups: deepCopy(lastConfig.Groups),
 	}
-	newGroups := make(map[int][]string, len(lastConfig.Groups))
-	for k, v := range lastConfig.Groups {
-		newGroups[k] = v
-	}
-	newConfig.Groups = newGroups
 
 	g2s := GetGroup2Shard(newConfig)
 	// 记录删除的group有哪些shard
@@ -320,12 +330,8 @@ func (sm *ShardMaster) MoveHandle(Gid int, Shard int) {
 	newConfig := Config{
 		Num:    len(sm.configs),
 		Shards: lastConfig.Shards,
+		Groups: deepCopy(lastConfig.Groups),
 	}
-	newGroups := make(map[int][]string, len(lastConfig.Groups))
-	for k, v := range lastConfig.Groups {
-		newGroups[k] = v
-	}
-	newConfig.Groups = newGroups
 
 	var newShards [NShards]int = newConfig.Shards
 	newShards[Shard] = Gid
@@ -333,7 +339,20 @@ func (sm *ShardMaster) MoveHandle(Gid int, Shard int) {
 	sm.configs = append(sm.configs, newConfig)
 }
 
-func (sm *ShardMaster) ApplyState(op Op) {
+func (sm *ShardMaster) QueryHandle(op *Op) {
+	num := op.Num
+	if num == -1 || num >= len(sm.configs) {
+		num = len(sm.configs) - 1
+	}
+	config := sm.configs[num]
+	op.Conf = Config{
+		Num:    config.Num,
+		Shards: config.Shards,
+		Groups: deepCopy(config.Groups),
+	}
+}
+
+func (sm *ShardMaster) ApplyState(op *Op) {
 	switch op.Cmd {
 	case "Join":
 		sm.JoinHandle(op.Servers)
@@ -342,7 +361,7 @@ func (sm *ShardMaster) ApplyState(op Op) {
 	case "Move":
 		sm.MoveHandle(op.GID, op.Shard)
 	case "Query":
-		break
+		sm.QueryHandle(op)
 	default:
 		DPrintf("[shardmaster] server %d unknow op %s", sm.me, op.Cmd)
 	}
@@ -368,7 +387,7 @@ func (sm *ShardMaster) Run() {
 		cmdIdx := op.CmdIdx
 		sm.mu.Lock()
 		if !sm.IsStaleReq(clientId, cmdIdx) { // 老的request不需要更新状态
-			sm.ApplyState(op) // 更新state
+			sm.ApplyState(&op) // 更新state
 			sm.clientReq[clientId] = cmdIdx
 		}
 		ch, ok := sm.waiter[idx]
