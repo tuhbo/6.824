@@ -116,14 +116,14 @@ func (ck *Clerk) Common(req *CommonClientReq) string {
 				DPrintf("send %s to server[%d]", *req, newLeaderId)
 				ok := ck.make_end(servers[newLeaderId]).Call("ShardKV.CommonClientRequest", req, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					DPrintf("client %d %s reply %v ok from server %d %v", ck.clientId, ClientOpToString(req.Op), reply, newLeaderId, reply.Err)
+					DPrintf("client %d key %s value %s %s reply %v ok from server %d %v", ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, newLeaderId, reply.Err)
 					ck.leaderIds[gid] = newLeaderId
 					return reply.Value
 				} else if ok && (reply.Err == ErrWrongGroup) {
-					DPrintf("client %d %s reply %v wrong group %d server %d", ck.clientId, ClientOpToString(req.Op), reply, gid, newLeaderId)
+					DPrintf("client %d key %s value %s %s reply %v wrong group %d server %d", ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, gid, newLeaderId)
 					break
 				} else {
-					DPrintf("client %d %s reply %v wrong leader %d", ck.clientId, ClientOpToString(req.Op), reply, newLeaderId)
+					DPrintf("client %d key %s value %s %s reply %v wrong leader %d", ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, newLeaderId)
 					newLeaderId = (newLeaderId + 1) % len(servers)
 					if newLeaderId == oldLeaderId {
 						break

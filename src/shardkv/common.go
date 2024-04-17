@@ -29,7 +29,7 @@ const (
 
 type Err string
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -82,7 +82,7 @@ func ClientOpToString(Op ClientOp) string {
 
 type ClientRequestContext struct {
 	ReqSeq int64
-	reply  CommonReply
+	reply  *CommonReply
 }
 
 type LogEventType int

@@ -14,17 +14,6 @@ import (
 	"6.824/src/shardmaster"
 )
 
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-	Key      string
-	Value    string
-	ClientId int64
-	CmdIdx   int64
-	Cmd      string
-}
-
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
@@ -48,10 +37,11 @@ type ShardKV struct {
 func (kv *ShardKV) SubmitLog(event LogEvent, reply *CommonReply) {
 	idx, _, isLeader := kv.rf.Start(event)
 	if !isLeader {
-		DPrintf("server %d is not leader event %s failed", kv.me, event)
+		DPrintf("gid[%d] server[%d] is not leader event %s failed", kv.gid, kv.me, event)
 		reply.Err = ErrWrongLeader
 		return
 	}
+	DPrintf("server[%d] gid[%d] append log idx %d event %s", kv.gid, kv.me, idx, event)
 
 	kv.mu.Lock()
 	ch, ok := kv.waiter[idx] // 创建一个waiter，用于等待raft提交log
@@ -80,16 +70,8 @@ func (kv *ShardKV) SubmitLog(event LogEvent, reply *CommonReply) {
 	if !ret {
 		reply.Err = ErrWrongLeader
 	} else {
-		reply = res
-	}
-}
-
-func (kv *ShardKV) ApplyState(op Op) {
-	switch op.Cmd {
-	case "Put":
-		kv.db[op.Key] = op.Value
-	case "Append":
-		kv.db[op.Key] += op.Value
+		reply.Err = res.Err
+		reply.Value = res.Value
 	}
 }
 
@@ -105,11 +87,12 @@ func (kv *ShardKV) CommonClientRequest(args *CommonClientReq, reply *CommonReply
 	kv.mu.Lock()
 	if args.Op != OpGet && kv.IsStaleReq(args.ClientId, args.ReqSeq) {
 		lastReplyContext := kv.clientReq[args.ClientId]
-		*reply = lastReplyContext.reply
+		reply.Err = lastReplyContext.reply.Err
 		kv.mu.Unlock()
 		return
 	}
 	if !kv.canServe(key2shard(args.Key)) {
+		DPrintf("gid[%d] server[%d] not server for key %s req %v", args.Key, args)
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
@@ -177,6 +160,69 @@ func (kv *ShardKV) PollCfg() {
 	}
 }
 
+func (kv *ShardKV) ApplyToStateMachine(shardId int, args *CommonClientReq) *CommonReply {
+	reply := CommonReply{
+		Err: OK,
+	}
+	kv.mu.Lock()
+	shard, ok := kv.stateMachines[shardId]
+	if !ok {
+		if args.Op == OpGet {
+			DPrintf("server[%d] group[%d] shardId %d do not has key %s", kv.me, kv.gid, shardId, args.Key)
+			reply.Err = ErrNoKey
+			kv.mu.Unlock()
+			return &reply
+		} else {
+			kv.stateMachines[shardId] = NewShard()
+			shard = kv.stateMachines[shardId]
+		}
+	}
+	switch args.Op {
+	case OpGet:
+		if val, ok := shard.KV[args.Key]; !ok {
+			reply.Err = ErrNoKey
+		} else {
+			reply.Err = OK
+			reply.Value = val
+		}
+		break
+	case OpPut:
+		shard.KV[args.Key] = args.Value
+		break
+	case OpAppend:
+		shard.KV[args.Key] += args.Value
+		break
+	}
+	kv.mu.Unlock()
+	return &reply
+}
+
+func (kv *ShardKV) ApplyClientReq(msg *raft.ApplyMsg, args *CommonClientReq) *CommonReply {
+	shardId := key2shard(args.Key)
+	if kv.canServe(shardId) {
+		if args.Op != OpGet && kv.IsStaleReq(args.ClientId, args.ReqSeq) {
+			DPrintf("server[%d] group[%d] do not apply dup message  %v to statemachine maxAppliedCmd %v for client %v",
+				kv.me, kv.gid, msg, kv.clientReq[args.ClientId], args.ClientId)
+			return kv.clientReq[args.ClientId].reply
+		} else {
+			reply := kv.ApplyToStateMachine(shardId, args)
+			if args.Op != OpGet {
+				kv.mu.Lock()
+				kv.clientReq[args.ClientId] = ClientRequestContext{
+					ReqSeq: args.ReqSeq,
+					reply:  reply,
+				}
+				kv.mu.Unlock()
+				return reply
+			}
+		}
+	}
+	DPrintf("gid[%d] server[%d] can not server for req %v config %v", kv.gid, kv.me, args, kv.curConf)
+	return &CommonReply{
+		Err: ErrWrongGroup,
+	}
+}
+
 func (kv *ShardKV) Apply() {
 	for !kv.killed() {
 		msg := <-kv.applyCh // raft集群已经提交log
@@ -192,15 +238,17 @@ func (kv *ShardKV) Apply() {
 			d.Decode(&kv.clientReq)
 			kv.mu.Unlock()
 		} else {
-			event := msg.Command.(LogEvent)
 			idx := msg.CommandIndex
-			clientId := op.ClientId
-			cmdIdx := op.CmdIdx
-			kv.mu.Lock()
-			if !kv.IsStaleReq(clientId, cmdIdx) && kv.canServe(key2shard(op.Key)) { // 老的request不需要更新状态
-				kv.ApplyState(op) // 更新state
-				kv.clientReq[clientId] = cmdIdx
+			DPrintf("server[%d] gid[%d] apply idx %d", kv.me, kv.gid, idx)
+			event := msg.Command.(LogEvent)
+			var reply *CommonReply
+			switch event.Type {
+			case ClientRequest:
+				arg := event.Data.(CommonClientReq)
+				reply = kv.ApplyClientReq(&msg, &arg)
+				break
 			}
+			kv.mu.Lock()
 
 			if kv.maxraftstate != -1 && kv.rf.StateSize() > kv.maxraftstate {
 				// 快照信息包括kv.db 和 clientreq
@@ -214,7 +262,7 @@ func (kv *ShardKV) Apply() {
 			}
 			ch, ok := kv.waiter[idx]
 			if ok {
-				ch <- op // 唤醒rpc handle，回复client
+				ch <- reply // 唤醒rpc handle，回复client
 			}
 			kv.mu.Unlock()
 		}
@@ -250,7 +298,8 @@ func (kv *ShardKV) Apply() {
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(LogEvent{})
+	labgob.Register(CommonClientReq{})
 
 	kv := new(ShardKV)
 	kv.me = me
