@@ -21,6 +21,8 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrOutDated    = "ErrOutDated"
+	ErrNotReady    = "ErrNotReady"
 )
 
 const (
@@ -89,8 +91,8 @@ type LogEventType int
 
 const (
 	ClientRequest LogEventType = iota
-	Configuration
-	AddShard
+	UpdateConfig
+	MigrateShard
 	DeleteShard
 )
 
@@ -108,4 +110,16 @@ func NewLogEvent(t LogEventType, d interface{}) LogEvent {
 		Type: t,
 		Data: d,
 	}
+}
+
+type MigrateShardDataReq struct {
+	ConfNum int
+	Shards  []int
+}
+
+type MigrateShardDataReply struct {
+	Err       Err
+	ConfNum   int
+	ShardData map[int]map[string]string
+	ClientReq map[int64]ClientRequestContext
 }

@@ -113,17 +113,18 @@ func (ck *Clerk) Common(req *CommonClientReq) string {
 			newLeaderId := oldLeaderId
 			for {
 				var reply CommonReply
-				DPrintf("send %s to server[%d]", *req, newLeaderId)
+				DPrintf("send %s to gid[%d] server[%d]", *req, gid, newLeaderId)
 				ok := ck.make_end(servers[newLeaderId]).Call("ShardKV.CommonClientRequest", req, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					DPrintf("client %d key %s value %s %s reply %v ok from server %d %v", ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, newLeaderId, reply.Err)
+					DPrintf("client %d key %s value %s %s reply %v ok from gid[%d] server[%d] %v",
+						ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, gid, newLeaderId, reply.Err)
 					ck.leaderIds[gid] = newLeaderId
 					return reply.Value
 				} else if ok && (reply.Err == ErrWrongGroup) {
-					DPrintf("client %d key %s value %s %s reply %v wrong group %d server %d", ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, gid, newLeaderId)
+					DPrintf("client %d key %s value %s %s reply %v wrong gid[%d] server[%d]", ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, gid, newLeaderId)
 					break
 				} else {
-					DPrintf("client %d key %s value %s %s reply %v wrong leader %d", ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, newLeaderId)
+					DPrintf("ok %T client %d key %s value %s %s reply %v gid[%d] wrong leader[%d]", ok, ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, gid, newLeaderId)
 					newLeaderId = (newLeaderId + 1) % len(servers)
 					if newLeaderId == oldLeaderId {
 						break
