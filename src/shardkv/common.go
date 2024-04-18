@@ -27,11 +27,12 @@ const (
 
 const (
 	PollCfgTimeOut = 50 * time.Millisecond
+	MigrateTimeOut = 30 * time.Millisecond
 )
 
 type Err string
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -84,7 +85,7 @@ func ClientOpToString(Op ClientOp) string {
 
 type ClientRequestContext struct {
 	ReqSeq int64
-	reply  *CommonReply
+	Reply  *CommonReply
 }
 
 type LogEventType int
@@ -93,8 +94,22 @@ const (
 	ClientRequest LogEventType = iota
 	UpdateConfig
 	MigrateShard
-	DeleteShard
+	GcShard
 )
+
+func LogEventTypeToString(t LogEventType) string {
+	switch t {
+	case ClientRequest:
+		return "ClientRequest"
+	case UpdateConfig:
+		return "UpdateConfig"
+	case MigrateShard:
+		return "MigateShard"
+	case GcShard:
+		return "GcShard"
+	}
+	return "unknown"
+}
 
 type LogEvent struct {
 	Type LogEventType
@@ -102,7 +117,7 @@ type LogEvent struct {
 }
 
 func (event LogEvent) String() string {
-	return fmt.Sprintf("LogEvent {type %v, Data %v}", event.Type, event.Data)
+	return fmt.Sprintf("LogEvent {type:%s, Data:%v}", LogEventTypeToString(event.Type), event.Data)
 }
 
 func NewLogEvent(t LogEventType, d interface{}) LogEvent {

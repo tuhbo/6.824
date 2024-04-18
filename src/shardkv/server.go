@@ -87,7 +87,7 @@ func (kv *ShardKV) CommonClientRequest(args *CommonClientReq, reply *CommonReply
 	kv.mu.Lock()
 	if args.Op != OpGet && kv.IsStaleReq(args.ClientId, args.ReqSeq) {
 		lastReplyContext := kv.clientReq[args.ClientId]
-		reply.Err = lastReplyContext.reply.Err
+		reply.Err = lastReplyContext.Reply.Err
 		kv.mu.Unlock()
 		return
 	}
@@ -181,14 +181,14 @@ func (kv *ShardKV) ApplyClientReq(args *CommonClientReq) *CommonReply {
 		if args.Op != OpGet && kv.IsStaleReq(args.ClientId, args.ReqSeq) {
 			DPrintf("gid[%d] server[%d] do not apply req %v to statemachine maxAppliedCmd %v",
 				kv.gid, kv.me, args, kv.clientReq[args.ClientId])
-			lastRely := kv.clientReq[args.ClientId].reply
+			lastRely := kv.clientReq[args.ClientId].Reply
 			return lastRely
 		} else {
 			reply := kv.ApplyToStateMachine(shardId, args)
 			if args.Op != OpGet {
 				kv.clientReq[args.ClientId] = ClientRequestContext{
 					ReqSeq: args.ReqSeq,
-					reply:  reply,
+					Reply:  reply,
 				}
 			}
 			return reply
@@ -263,7 +263,7 @@ func (kv *ShardKV) PullConf() {
 	kv.mu.Lock()
 	for id, shard := range kv.stateMachines {
 		if shard.Status != Active { // group中还有分片任务没有完成，不能更新配置
-			DPrintf("gid[%d] server[%d] shardId %d status not active", kv.gid, kv.me, id)
+			DPrintf("gid[%d] server[%d] shardId %d status not active, do not pull new conf", kv.gid, kv.me, id)
 			canPullConf = false
 			break
 		}
@@ -295,9 +295,25 @@ func (kv *ShardKV) MigrateShardData(args *MigrateShardDataReq, reply *MigrateSha
 		return
 	}
 
+	reply.ShardData = make(map[int]map[string]string)
 	for _, shardId := range args.Shards {
 		reply.ShardData[shardId] = kv.stateMachines[shardId].deepCopy()
 	}
+
+	reply.ClientReq = make(map[int64]ClientRequestContext)
+	for clientId, ctx := range kv.clientReq {
+		reply.ClientReq[clientId] = ClientRequestContext{
+			ReqSeq: ctx.ReqSeq,
+			Reply: &CommonReply{
+				Err:   ctx.Reply.Err,
+				Value: ctx.Reply.Value,
+			},
+		}
+	}
+	reply.Err, reply.ConfNum = OK, kv.curConf.Num
+	DPrintf("gid[%d] server[%d] complete migrate shard %v data", kv.gid, kv.me, *args)
+	kv.mu.Unlock()
+
 }
 
 func (kv *ShardKV) PullShardData() {
@@ -305,26 +321,61 @@ func (kv *ShardKV) PullShardData() {
 	migratingShards := kv.GetShardByStatus(Migrating)
 	var wg sync.WaitGroup
 	for gid, shards := range migratingShards {
-		DPrintf("gid[%d] server[%d] start pull shards %v data from gid %d", kv.gid, kv.me, shards, gid)
 		wg.Add(1)
-		go func(servers []string, shards []int, confNum int) {
-			var reply MigrateShardDataReply
+		go func(servers []string, shards []int, confNum int, lastGid int) {
 			args := MigrateShardDataReq{
 				ConfNum: confNum,
 				Shards:  shards,
 			}
-			for _, server := range servers {
+			for i, server := range servers {
+				var reply MigrateShardDataReply
+				DPrintf("gid[%d] server[%d] start pull shards %v data from gid[%d] server[%d]", kv.gid, kv.me, shards, lastGid, i)
 				ok := kv.make_end(server).Call("ShardKV.MigrateShardData", &args, &reply)
 				if ok && reply.Err == OK {
-					DPrintf("gid[%d] server[%d] get shards %v data", kv.gid, kv.me, shards)
+					DPrintf("gid[%d] server[%d] get shards %v data reply %v", kv.gid, kv.me, shards, reply)
 					kv.SubmitLog(NewLogEvent(MigrateShard, reply), &CommonReply{})
 				}
 			}
 			wg.Done()
-		}(kv.lastConf.Groups[gid], shards, kv.curConf.Num)
+		}(kv.lastConf.Groups[gid], shards, kv.curConf.Num, gid)
 	}
 	kv.mu.Unlock()
 	wg.Wait()
+}
+
+func (kv *ShardKV) ApplyMigrateShardData(reply *MigrateShardDataReply) *CommonReply {
+	if reply.ConfNum == kv.curConf.Num {
+		for shardId, db := range reply.ShardData {
+			shard := kv.stateMachines[shardId]
+			if shard.Status == Migrating {
+				for key, val := range db {
+					shard.KV[key] = val
+				}
+				shard.Status = Gcing
+			} else {
+				DPrintf("gid[%d] server[%d] dup migrate shard data curConf num %d reply.ConfNum %d", kv.gid, kv.me, kv.curConf.Num, reply.ConfNum)
+				break
+			}
+		}
+
+		for clientId, ctx := range reply.ClientReq {
+			if lastReply, ok := kv.clientReq[clientId]; !ok || lastReply.ReqSeq < ctx.ReqSeq {
+				kv.clientReq[clientId] = ClientRequestContext{
+					ReqSeq: ctx.ReqSeq,
+					Reply: &CommonReply{
+						Err:   ctx.Reply.Err,
+						Value: ctx.Reply.Value,
+					},
+				}
+
+			}
+		}
+		DPrintf("gid[%d] server[%d] apply migrate shard data curConf num %d reply.ConfNum %d complete states %v",
+			kv.gid, kv.me, kv.curConf.Num, reply.ConfNum, kv.stateMachines)
+		return &CommonReply{Err: OK}
+	}
+	DPrintf("gid[%d] server[%d] reject stale migrate shard data curConf num %d reply.ConfNum %d", kv.gid, kv.me, kv.curConf.Num, reply.ConfNum)
+	return &CommonReply{Err: ErrOutDated}
 }
 
 func (kv *ShardKV) Daemon(callBack func(), timeout time.Duration) {
@@ -362,6 +413,9 @@ func (kv *ShardKV) Apply() {
 			case UpdateConfig:
 				newConf := event.Data.(shardmaster.Config)
 				reply = kv.ApplyConfigUpdate(&newConf)
+			case MigrateShard:
+				migrateReply := event.Data.(MigrateShardDataReply)
+				reply = kv.ApplyMigrateShardData(&migrateReply)
 			}
 
 			if kv.maxraftstate != -1 && kv.rf.StateSize() > kv.maxraftstate {
@@ -415,6 +469,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(LogEvent{})
 	labgob.Register(CommonClientReq{})
 	labgob.Register(shardmaster.Config{})
+	labgob.Register(MigrateShardDataReply{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -438,6 +493,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	go kv.Apply()
 	go kv.Daemon(kv.PullConf, PollCfgTimeOut)
+	go kv.Daemon(kv.PullShardData, MigrateTimeOut)
 
 	return kv
 }
