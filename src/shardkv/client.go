@@ -101,6 +101,7 @@ func (ck *Clerk) Append(key string, value string) {
 }
 
 func (ck *Clerk) Common(req *CommonClientReq) string {
+	start := time.Now()
 	for {
 		shard := key2shard(req.Key)
 		gid := ck.config.Shards[shard]
@@ -121,7 +122,9 @@ func (ck *Clerk) Common(req *CommonClientReq) string {
 					ck.leaderIds[gid] = newLeaderId
 					return reply.Value
 				} else if ok && (reply.Err == ErrWrongGroup) {
-					DPrintf("client %d key %s value %s %s reply %v wrong gid[%d] server[%d]", ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, gid, newLeaderId)
+					if time.Since(start) > 10*time.Second {
+						DPrintf("client %d key %s value %s %s reply %v wrong gid[%d] server[%d]", ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, gid, newLeaderId)
+					}
 					break
 				} else {
 					DPrintf("ok %T client %d key %s value %s %s reply %v gid[%d] wrong leader[%d]", ok, ck.clientId, req.Key, req.Value, ClientOpToString(req.Op), reply, gid, newLeaderId)

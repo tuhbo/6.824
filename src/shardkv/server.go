@@ -4,6 +4,7 @@ package shardkv
 import (
 	"bytes"
 	"encoding/gob"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -128,12 +129,19 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 
 	var stateMachines map[int]*Shard
 	var clientReq map[int64]ClientRequestContext
+	var lastConf shardmaster.Config
+	var curConf shardmaster.Config
 
-	if d.Decode(&stateMachines) != nil || d.Decode(&clientReq) != nil {
+	if d.Decode(&stateMachines) != nil || d.Decode(&clientReq) != nil || d.Decode(&lastConf) != nil || d.Decode(&curConf) != nil {
 		DPrintf("readSnapshot err")
+		log.Panicf("gid[%d] server[%d] readSnapShort err", kv.gid, kv.me)
 	} else {
 		kv.stateMachines = stateMachines
 		kv.clientReq = clientReq
+		kv.lastConf = lastConf
+		kv.curConf = curConf
+		DPrintf("gid[%d] server[%d] read snap stateMachines %v clientReq %v lastConf %v curConf %v",
+			kv.gid, kv.me, kv.stateMachines, kv.clientReq, kv.lastConf, kv.curConf)
 	}
 }
 
@@ -146,16 +154,7 @@ func (kv *ShardKV) ApplyToStateMachine(shardId int, args *CommonClientReq) *Comm
 	reply := CommonReply{
 		Err: OK,
 	}
-	shard, ok := kv.stateMachines[shardId]
-	if !ok {
-		if args.Op == OpGet {
-			DPrintf("gid[%d] server[%d] shardId %d do not has key %v", kv.me, kv.gid, shardId, args)
-			reply.Err = ErrNoKey
-			return &reply
-		}
-		kv.stateMachines[shardId] = NewShard()
-		shard = kv.stateMachines[shardId]
-	}
+	shard := kv.stateMachines[shardId]
 	switch args.Op {
 	case OpGet:
 		if val, ok := shard.KV[args.Key]; !ok {
@@ -255,6 +254,7 @@ func (kv *ShardKV) ApplyConfigUpdate(newConf *shardmaster.Config) *CommonReply {
 		kv.curConf = *newConf
 		return &CommonReply{Err: OK}
 	}
+	DPrintf("gid[%d] server[%d] cant apply update newConfNum %v oldConfNum %v", kv.gid, kv.me, newConf.Num, kv.curConf.Num)
 	return &CommonReply{Err: ErrOutDated}
 }
 
@@ -378,6 +378,85 @@ func (kv *ShardKV) ApplyMigrateShardData(reply *MigrateShardDataReply) *CommonRe
 	return &CommonReply{Err: ErrOutDated}
 }
 
+func (kv *ShardKV) GcShardData(args *GcShardDataReq, reply *GcShardDataReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		DPrintf("gid[%d] server[%d] gc %v shard data err wrong leader", kv.gid, kv.me, *args)
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	if args.ConfNum > kv.curConf.Num {
+		reply.Err = ErrNotReady
+		DPrintf("gid[%d] server[%d] confnum %d not ready for req %v", kv.gid, kv.me, kv.curConf.Num, *args)
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	var response CommonReply
+	kv.SubmitLog(NewLogEvent(GcShard, *args), &response)
+	reply.Err = response.Err
+}
+
+func (kv *ShardKV) GetShardStatus() map[int]ShardStatus {
+	shardStatusMap := make(map[int]ShardStatus)
+	for shardId, s := range kv.stateMachines {
+		shardStatusMap[shardId] = s.Status
+	}
+	return shardStatusMap
+}
+
+func (kv *ShardKV) ApplyGcShard(args *GcShardDataReq) *CommonReply {
+	if args.ConfNum == kv.curConf.Num {
+		DPrintf("gid[%d] server[%d] shards status are %v before accepting gc req %v when currentConfig is %v",
+			kv.gid, kv.me, kv.GetShardStatus(), args, kv.curConf)
+		for _, shardId := range args.Shards {
+			shard := kv.stateMachines[shardId]
+			if shard.Status == Gcing {
+				shard.Status = Active
+			} else if shard.Status == BePulled {
+				kv.stateMachines[shardId] = NewShard()
+			} else {
+				DPrintf("gid[%d] server[%d] dup gc shard data curConf num %d args %v", kv.gid, kv.me, kv.curConf.Num, *args)
+				break
+			}
+		}
+		DPrintf("gid[%d] server[%d] apply gc shard data curConf num %d args %v shardstatus %v",
+			kv.gid, kv.me, kv.curConf.Num, *args, kv.GetShardStatus())
+		return &CommonReply{Err: OK}
+	}
+	DPrintf("gid[%d] server[%d] reject gc shard data curConf num %d args %v", kv.gid, kv.me, kv.curConf.Num, *args)
+	return &CommonReply{Err: ErrOutDated}
+}
+
+func (kv *ShardKV) DeleteShardData() {
+	kv.mu.Lock()
+	deleteShards := kv.GetShardByStatus(Gcing)
+	var wg sync.WaitGroup
+	for gid, shards := range deleteShards {
+		wg.Add(1)
+		go func(servers []string, shards []int, confNum int, lastGid int) {
+			args := GcShardDataReq{
+				ConfNum: confNum,
+				Shards:  shards,
+			}
+			for i, server := range servers {
+				var reply GcShardDataReply
+				DPrintf("gid[%d] server[%d] start gc shards %v data to gid[%d] server[%d]", kv.gid, kv.me, shards, lastGid, i)
+				ok := kv.make_end(server).Call("ShardKV.GcShardData", &args, &reply)
+				if ok && reply.Err == OK {
+					DPrintf("gid[%d] server[%d] gc shards %v data complete reply %v", kv.gid, kv.me, shards, reply)
+					kv.SubmitLog(NewLogEvent(GcShard, args), &CommonReply{})
+				}
+			}
+			wg.Done()
+		}(kv.lastConf.Groups[gid], shards, kv.curConf.Num, gid)
+	}
+	kv.mu.Unlock()
+	wg.Wait()
+}
+
 func (kv *ShardKV) Daemon(callBack func(), timeout time.Duration) {
 	for !kv.killed() {
 		if _, isLeader := kv.rf.GetState(); isLeader {
@@ -387,19 +466,28 @@ func (kv *ShardKV) Daemon(callBack func(), timeout time.Duration) {
 	}
 }
 
+func (kv *ShardKV) SnapShot(idx int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.stateMachines)
+	e.Encode(kv.clientReq)
+	e.Encode(kv.lastConf)
+	e.Encode(kv.curConf)
+
+	snapshot := w.Bytes()
+	kv.rf.SnapShot(idx, snapshot)
+	DPrintf("gid[%d] server[%d] make snap shot stateMachines %v clientReq %v lastConf %v curConf %v",
+		kv.gid, kv.me, kv.stateMachines, kv.clientReq, kv.lastConf, kv.curConf)
+}
+
 func (kv *ShardKV) Apply() {
 	for !kv.killed() {
 		msg := <-kv.applyCh // raft集群已经提交log
 
 		if !msg.CommandValid { // follower收到leader的快照
-			r := bytes.NewBuffer(msg.SnapShot)
-			d := gob.NewDecoder(r)
-
 			kv.mu.Lock()
-			kv.stateMachines = make(map[int]*Shard)
-			kv.clientReq = make(map[int64]ClientRequestContext)
-			d.Decode(&kv.stateMachines)
-			d.Decode(&kv.clientReq)
+			DPrintf("gid[%d] server[%d] read snap", kv.gid, kv.me)
+			kv.readSnapshot(msg.SnapShot)
 			kv.mu.Unlock()
 		} else {
 			kv.mu.Lock()
@@ -416,17 +504,13 @@ func (kv *ShardKV) Apply() {
 			case MigrateShard:
 				migrateReply := event.Data.(MigrateShardDataReply)
 				reply = kv.ApplyMigrateShardData(&migrateReply)
+			case GcShard:
+				args := event.Data.(GcShardDataReq)
+				reply = kv.ApplyGcShard(&args)
 			}
 
 			if kv.maxraftstate != -1 && kv.rf.StateSize() > kv.maxraftstate {
-				// 快照信息包括kv.db 和 clientreq
-				w := new(bytes.Buffer)
-				e := labgob.NewEncoder(w)
-				e.Encode(kv.stateMachines)
-				e.Encode(kv.clientReq)
-
-				snapshot := w.Bytes()
-				kv.rf.SnapShot(idx, snapshot)
+				kv.SnapShot(idx)
 			}
 			ch, ok := kv.waiter[idx]
 			if ok {
@@ -470,6 +554,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(CommonClientReq{})
 	labgob.Register(shardmaster.Config{})
 	labgob.Register(MigrateShardDataReply{})
+	labgob.Register(GcShardDataReq{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -494,6 +579,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.Apply()
 	go kv.Daemon(kv.PullConf, PollCfgTimeOut)
 	go kv.Daemon(kv.PullShardData, MigrateTimeOut)
+	go kv.Daemon(kv.DeleteShardData, GcTimeOut)
 
 	return kv
 }

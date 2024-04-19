@@ -28,6 +28,7 @@ const (
 const (
 	PollCfgTimeOut = 50 * time.Millisecond
 	MigrateTimeOut = 30 * time.Millisecond
+	GcTimeOut      = 30 * time.Millisecond
 )
 
 type Err string
@@ -88,6 +89,10 @@ type ClientRequestContext struct {
 	Reply  *CommonReply
 }
 
+func (c ClientRequestContext) String() string {
+	return fmt.Sprintf("ReqSeq %d Reply %v", c.ReqSeq, *c.Reply)
+}
+
 type LogEventType int
 
 const (
@@ -137,4 +142,13 @@ type MigrateShardDataReply struct {
 	ConfNum   int
 	ShardData map[int]map[string]string
 	ClientReq map[int64]ClientRequestContext
+}
+
+type GcShardDataReq struct {
+	ConfNum int
+	Shards  []int
+}
+
+type GcShardDataReply struct {
+	Err Err
 }
