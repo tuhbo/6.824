@@ -26,9 +26,10 @@ const (
 )
 
 const (
-	PollCfgTimeOut = 50 * time.Millisecond
-	MigrateTimeOut = 30 * time.Millisecond
-	GcTimeOut      = 30 * time.Millisecond
+	PollCfgTimeOut  = 50 * time.Millisecond
+	MigrateTimeOut  = 30 * time.Millisecond
+	GcTimeOut       = 30 * time.Millisecond
+	CheckEmptyEntry = 100 * time.Millisecond
 )
 
 type Err string
@@ -100,6 +101,7 @@ const (
 	UpdateConfig
 	MigrateShard
 	GcShard
+	EmptyEntry
 )
 
 func LogEventTypeToString(t LogEventType) string {
@@ -112,6 +114,8 @@ func LogEventTypeToString(t LogEventType) string {
 		return "MigateShard"
 	case GcShard:
 		return "GcShard"
+	case EmptyEntry:
+		return "EmptyEntry"
 	}
 	return "unknown"
 }

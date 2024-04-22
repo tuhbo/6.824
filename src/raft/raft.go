@@ -369,6 +369,20 @@ func (rf *Raft) replicator(peer int) {
 	rf.repCond[peer].L.Unlock()
 }
 
+func (rf *Raft) HasLogInCurrentTerm() bool {
+	var ret bool = false
+	rf.mu.Lock()
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		if rf.log[i].Term == rf.curTerm {
+			ret = true
+			break
+		}
+	}
+	rf.mu.Unlock()
+	return ret
+
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays

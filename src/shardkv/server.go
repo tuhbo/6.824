@@ -190,6 +190,7 @@ func (kv *ShardKV) ApplyClientReq(args *CommonClientReq) *CommonReply {
 					Reply:  reply,
 				}
 			}
+			DPrintf("gid[%d] server[%d] complete commit req %v shardId %d config %v", kv.gid, kv.me, args, shardId, kv.curConf)
 			return reply
 		}
 	}
@@ -248,13 +249,13 @@ func (kv *ShardKV) UpdateShardStatus(newConf *shardmaster.Config) {
 
 func (kv *ShardKV) ApplyConfigUpdate(newConf *shardmaster.Config) *CommonReply {
 	if newConf.Num == kv.curConf.Num+1 {
-		DPrintf("gid[%d] server[%d] update newConf %v oldConf %v", kv.gid, kv.me, *newConf, kv.curConf)
+		DPrintf("gid[%d] server[%d] commit update newConf %v oldConf %v", kv.gid, kv.me, *newConf, kv.curConf)
 		kv.UpdateShardStatus(newConf)
 		kv.lastConf = kv.curConf
 		kv.curConf = *newConf
 		return &CommonReply{Err: OK}
 	}
-	DPrintf("gid[%d] server[%d] cant apply update newConfNum %v oldConfNum %v", kv.gid, kv.me, newConf.Num, kv.curConf.Num)
+	DPrintf("gid[%d] server[%d] can not apply update newConfNum %v oldConfNum %v", kv.gid, kv.me, newConf.Num, kv.curConf.Num)
 	return &CommonReply{Err: ErrOutDated}
 }
 
@@ -263,7 +264,8 @@ func (kv *ShardKV) PullConf() {
 	kv.mu.Lock()
 	for id, shard := range kv.stateMachines {
 		if shard.Status != Active { // group中还有分片任务没有完成，不能更新配置
-			DPrintf("gid[%d] server[%d] shardId %d status not active, do not pull new conf", kv.gid, kv.me, id)
+			DPrintf("gid[%d] server[%d] shardId %d status %s, do not pull new conf, curConfNum %d",
+				kv.gid, kv.me, id, ShardStatusToString(shard.Status), kv.curConf.Num)
 			canPullConf = false
 			break
 		}
@@ -273,7 +275,7 @@ func (kv *ShardKV) PullConf() {
 
 	if canPullConf {
 		newConf := kv.mck.Query(curConfNum + 1)
-		DPrintf("gid[%d] server[%d] pulled conf %d newconf %v", kv.gid, kv.me, curConfNum+1, newConf.Num)
+		DPrintf("gid[%d] server[%d] curconfNum %d newconfNum %v", kv.gid, kv.me, kv.curConf.Num, newConf.Num)
 		if newConf.Num == curConfNum+1 {
 			kv.SubmitLog(NewLogEvent(UpdateConfig, newConf), &CommonReply{})
 		}
@@ -370,8 +372,8 @@ func (kv *ShardKV) ApplyMigrateShardData(reply *MigrateShardDataReply) *CommonRe
 
 			}
 		}
-		DPrintf("gid[%d] server[%d] apply migrate shard data curConf num %d reply.ConfNum %d complete states %v",
-			kv.gid, kv.me, kv.curConf.Num, reply.ConfNum, kv.stateMachines)
+		DPrintf("gid[%d] server[%d] commit migrate shard data curConf num %d reply.ConfNum %d complete states %v",
+			kv.gid, kv.me, kv.curConf.Num, reply.ConfNum, kv.GetShardStatus())
 		return &CommonReply{Err: OK}
 	}
 	DPrintf("gid[%d] server[%d] reject stale migrate shard data curConf num %d reply.ConfNum %d", kv.gid, kv.me, kv.curConf.Num, reply.ConfNum)
@@ -410,7 +412,7 @@ func (kv *ShardKV) GetShardStatus() map[int]ShardStatus {
 func (kv *ShardKV) ApplyGcShard(args *GcShardDataReq) *CommonReply {
 	if args.ConfNum == kv.curConf.Num {
 		DPrintf("gid[%d] server[%d] shards status are %v before accepting gc req %v when currentConfig is %v",
-			kv.gid, kv.me, kv.GetShardStatus(), args, kv.curConf)
+			kv.gid, kv.me, kv.GetShardStatus(), *args, kv.curConf)
 		for _, shardId := range args.Shards {
 			shard := kv.stateMachines[shardId]
 			if shard.Status == Gcing {
@@ -422,7 +424,7 @@ func (kv *ShardKV) ApplyGcShard(args *GcShardDataReq) *CommonReply {
 				break
 			}
 		}
-		DPrintf("gid[%d] server[%d] apply gc shard data curConf num %d args %v shardstatus %v",
+		DPrintf("gid[%d] server[%d] commit gc shard data curConf num %d args %v shardstatus %v",
 			kv.gid, kv.me, kv.curConf.Num, *args, kv.GetShardStatus())
 		return &CommonReply{Err: OK}
 	}
@@ -457,6 +459,16 @@ func (kv *ShardKV) DeleteShardData() {
 	wg.Wait()
 }
 
+func (kv *ShardKV) CheckEmptyEntry() {
+	if !kv.rf.HasLogInCurrentTerm() {
+		kv.SubmitLog(NewLogEvent(EmptyEntry, nil), &CommonReply{})
+	}
+}
+
+func (kv *ShardKV) ApplyEmptyEntry() *CommonReply {
+	return &CommonReply{Err: OK}
+}
+
 func (kv *ShardKV) Daemon(callBack func(), timeout time.Duration) {
 	for !kv.killed() {
 		if _, isLeader := kv.rf.GetState(); isLeader {
@@ -476,8 +488,6 @@ func (kv *ShardKV) SnapShot(idx int) {
 
 	snapshot := w.Bytes()
 	kv.rf.SnapShot(idx, snapshot)
-	DPrintf("gid[%d] server[%d] make snap shot stateMachines %v clientReq %v lastConf %v curConf %v",
-		kv.gid, kv.me, kv.stateMachines, kv.clientReq, kv.lastConf, kv.curConf)
 }
 
 func (kv *ShardKV) Apply() {
@@ -507,6 +517,8 @@ func (kv *ShardKV) Apply() {
 			case GcShard:
 				args := event.Data.(GcShardDataReq)
 				reply = kv.ApplyGcShard(&args)
+			case EmptyEntry:
+				reply = kv.ApplyEmptyEntry()
 			}
 
 			if kv.maxraftstate != -1 && kv.rf.StateSize() > kv.maxraftstate {
@@ -580,6 +592,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.Daemon(kv.PullConf, PollCfgTimeOut)
 	go kv.Daemon(kv.PullShardData, MigrateTimeOut)
 	go kv.Daemon(kv.DeleteShardData, GcTimeOut)
+	go kv.Daemon(kv.CheckEmptyEntry, CheckEmptyEntry)
 
 	return kv
 }
